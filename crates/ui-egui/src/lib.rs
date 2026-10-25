@@ -444,6 +444,10 @@ pub struct LightcraftApp {
     slideshow_auto_paused: bool,
     /// Files dropped since the last UI pass, consumed exactly once by the UI phase.
     dropped_files: Vec<egui::DroppedFileHandle>,
+    /// `dropped_files` arrived while a prompt, the library window or its picker held drops back:
+    /// they are preserved through a dialog, Lightroom import, running Synchronize Folder or import
+    /// instead of taking the ordinary refusal path (which applies to a drop made outside the barrier).
+    deferred_dropped_files: bool,
     /// A synthetic batch was injected into a pass and has not been consumed by a completed
     /// (nondiscarded) UI pass yet: a hidden logic tick must not inject another one.
     synthetic_in_flight: bool,
@@ -632,6 +636,7 @@ impl LightcraftApp {
             slideshow_hidden_at: None,
             slideshow_auto_paused: false,
             dropped_files: vec![],
+            deferred_dropped_files: false,
             synthetic_in_flight: false,
             ui_passes: 0,
             #[cfg(test)]
@@ -2114,9 +2119,17 @@ impl LightcraftApp {
         self.last_time = t;
         panels::denoise::pump_ui_input(self, ctx, now);
         panels::faces::pump_ui_input(self, ctx, now);
-        // A prompt owns the library too: files dropped while it is up wait in the queue and are
-        // imported on the first UI pass after it goes away, never behind it.
-        if !panels::notices::blocks_input(self) {
+        // A prompt or the blocking library window owns the library too: files dropped while either
+        // is up wait in the queue and are imported on the first UI pass after it goes away, never
+        // behind it. With no library open the window's `hold_dropped` path still takes the photos
+        // once its own dialog and asynchronous library picker are gone, so `blocks_file_drops`
+        // only holds them back until then. Mark those drops: once the barrier opens they may find
+        // a dialog, Lightroom import or import that the library's own open started still running.
+        if panels::notices::blocks_input(self) || panels::library_problem::blocks_file_drops(self) {
+            if !self.dropped_files.is_empty() {
+                self.deferred_dropped_files = true;
+            }
+        } else {
             self.import_dropped_files(ctx);
         }
         self.check_external_editor(ctx);
@@ -2132,11 +2145,22 @@ impl LightcraftApp {
     /// hidden logic tick can never replay the last pass's drop. Web hosts call this in their UI
     /// phase (they need `bytes_async`, which is not available on a native file path).
     pub fn take_dropped_files(&mut self) -> Vec<egui::DroppedFileHandle> {
+        self.deferred_dropped_files = false;
         std::mem::take(&mut self.dropped_files)
     }
 
     /// Import native drops as presets, face models or photos.
     fn import_dropped_files(&mut self, ctx: &egui::Context) {
+        // A drop that waited behind a prompt or the library window is not dropped again just
+        // because a dialog, Lightroom catalog import, a running Synchronize Folder or the import
+        // a library open started is still running when the barrier goes. Keep it queued and try
+        // the next pass. A drop made outside the barrier keeps the deliberate "close the
+        // dialog"/"An import is running" refusal below.
+        if self.deferred_dropped_files && (self.ui.dialog.is_some() || self.lightroom.is_some() || self.sync_run.is_some() || import::running(self)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+        self.deferred_dropped_files = false;
         let dropped = self.take_dropped_files();
         if dropped.is_empty() {
             return;
@@ -2162,10 +2186,15 @@ impl LightcraftApp {
             return;
         }
         let drop = drop_overlay::classify(dropped);
-        if let Some(model) = drop.models.first()
-            && let Err(e) = panels::faces::open_dialog(self, model)
-        {
-            self.toast(ctx, e);
+        if let Some(model) = drop.models.first() {
+            // no library open yet (the launch list, a library that failed to open): its licence
+            // dialog would open behind the window that owns input. The drop is refused like a
+            // preset; photos below still wait for the library chosen.
+            if panels::library_problem::holds_drops(self) {
+                self.toast(ctx, crate::i18n::tr("Open a library first, then drop the model again"));
+            } else if let Err(e) = panels::faces::open_dialog(self, model) {
+                self.toast(ctx, e);
+            }
         }
         if !drop.presets.is_empty() {
             // presets live in a library: with none open they would go with the session it replaces
