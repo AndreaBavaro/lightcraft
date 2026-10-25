@@ -33,6 +33,38 @@ checkout or `CARGO_TARGET_DIR`. `cargo-sources.json` is written to a temporary
 file and atomically renamed only after the generator succeeds, so a failed run
 leaves the previous inventory untouched.
 
+Generation is capped at 30 minutes and the generator's stdin is `/dev/null`, so
+an interactive credential prompt fails instead of hanging. On POSIX systems
+(Linux is the supported Flatpak packaging platform) the generator starts in its
+own session; at the cap, the wrapper kills that generator's process group,
+including git clone/fetch descendants, and reaps its leader, so no orphan keeps
+writing into the cache. On Windows only the direct generator process is
+terminated; its git descendants are not tree-killed, and the timeout is
+otherwise the same. The timeout path runs before the atomic rename, so the
+existing inventory and the temporary-file cleanup behave exactly like any other
+generation failure.
+
+Because the generator no longer shares the wrapper's terminal session, the
+wrapper also handles Ctrl-C (`SIGINT`) and `SIGTERM` while it runs: the signal
+is recorded, the generator's process group is killed and reaped like the timeout
+path, the temporary file and script directory are removed, and only then is the
+signal replayed with the handler that was installed before generation started
+(`KeyboardInterrupt` for `SIGINT`, the previous or default action for
+`SIGTERM`). A cancelled `flatpak-builder` run or an interactive Ctrl-C therefore
+leaves neither a detached generator or git clone nor a modified inventory. The
+temporary handlers are installed before the generator is spawned, so a signal
+that arrives while the child is being created cannot strand the new session
+either. A cancellation delivered while those handlers are installed is recorded
+once (the first signal wins) and replayed after cleanup with the caller's
+restored handler. Signals that cannot be handled by this process at all
+(`SIGKILL`, an OOM kill, or a wrapper crash) cannot be cleaned up: the generator
+runs in its own session, so it may survive the wrapper, and any temporary output
+or script directory it had created remains. A hard termination between creating
+the temporary directory or output file and installing the handlers, or after
+`run_generator` returns while the output is being validated and renamed, can
+likewise leave those temporary paths behind (the complete temporary output in
+the latter case), because the default signal action performs no cleanup.
+
 ## Why two patches
 
 1. **Keep pinned revisions distinct.** Upstream keys `[source]` replacement
@@ -69,8 +101,16 @@ This validates the source inventory and offline metadata resolution only. A
 full `flatpak-builder` build against the `org.freedesktop.Sdk` 25.08 runtime and
 Rust extension is still required before release; it was not performed here.
 
-Run the wrapper failure-path regression tests with:
+Run the wrapper failure-path and cancellation regression tests (the real
+process-group cases, including Ctrl-C/`SIGTERM` cancellation of a live
+generator session, run on Linux only and are skipped elsewhere) with:
 
 ```sh
 python3 -B packaging/linux/flatpak/test_generate_cargo_sources.py
 ```
+
+The cancellation and timeout tests check process liveness and a frozen
+heartbeat before their teardown kills anything. With
+`LIGHTCRAFT_FLATPAK_TEST_BREAK_KILL=1` the group kill is a deliberate no-op and
+those tests must fail; run that variant to confirm they do not silently pass on
+a broken kill path.
