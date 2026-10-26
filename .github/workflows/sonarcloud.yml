@@ -19,6 +19,7 @@ jobs:
     # Track shared CI improvements on main.
     uses: storytold/craft-common-actions/.github/workflows/sonarcloud.yml@main
     with:
+      shards: 8
       python-coverage-source: packaging/linux/flatpak
       python-coverage-script: packaging/linux/flatpak/test_generate_cargo_sources.py
       timeout-minutes: 120
