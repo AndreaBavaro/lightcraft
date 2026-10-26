@@ -149,11 +149,15 @@ fn animation_view(mode: BeforeAfter, zoom: Zoom) -> AnimationView {
     let id = h.app.session.active().expect("a photo is open");
     let photo = h.app.session.catalog.photo(id).expect("it is in the catalog");
     assert_eq!((photo.width, photo.height), (WIDTH, HEIGHT), "the render fixture is a real 24 MP photo");
-    h.app.ui.before_after = mode;
+    // settle the single photo's source and Main render before the second pane exists: both pane
+    // jobs then reuse the decoded 24 MP source instead of decoding it twice
+    h.app.ui.before_after = BeforeAfter::Off;
     h.app.ui.zoom = zoom;
     h.app.ui.pan = (0.5, 0.5);
     h.app.ui.click_zoom = 300;
-    assert!(h.settle(SETTLE), "baseline renders settled");
+    assert!(h.settle(SETTLE), "the single photo's source and Main render settle");
+    h.app.ui.before_after = mode;
+    assert!(h.settle(SETTLE), "both pane renders settled");
     let before_id = h.app.renderer.textures[&Slot::Before].tex.id();
     let before = h
         .view
