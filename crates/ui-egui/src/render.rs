@@ -325,10 +325,26 @@ impl Renderer {
     /// Would asking for this thumbnail again (at `priority`) change nothing?
     pub fn thumb_current(&self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize, priority: u32) -> bool {
         let Some(&(ref old, size, key, quick, _)) = self.thumb_inputs.get(&photo.id) else { return false };
-        if old.as_ptr() != Arc::as_ptr(photo) || size != bucket {
+        if old.as_ptr() != Arc::as_ptr(photo) {
             return false;
         }
         let slot = Slot::Thumb(photo.id);
+        if size > bucket {
+            // A larger thumbnail that has already arrived for this photo and settings serves a
+            // smaller cell too (cells at different sizes share one photo). Asking for the smaller
+            // bucket would replace the larger picture, and the larger cell would then ask for its
+            // bucket back on the next frame: two print cells would alternate renders forever.
+            // The photo identity above is the renderer's `Weak<Photo>`: `Catalog` edits through
+            // `Arc::make_mut`, which (per std) moves the value to a new allocation whenever a
+            // `Weak` exists, even with one strong reference. An edit therefore breaks this match,
+            // and the key keeps an older picture of the same allocation from being reused. A
+            // larger request still renders once (below), and while it is in flight
+            // [`Self::thumb_pending_other_bucket`] holds the smaller callers.
+            return self.textures.get(&slot).is_some_and(|t| t.key == key);
+        }
+        if size != bucket {
+            return false;
+        }
         if quick && !self.textures.contains_key(&slot) {
             // Stand-in path (`grid::request_thumb`): the embedded preview is still on its way, or
             // the real thumbnail is requested at the background priority whatever the caller's.
@@ -347,10 +363,24 @@ impl Renderer {
     /// Whether the camera's embedded preview *is* this photo's thumbnail: its quick render arrived
     /// (so `Slot::ThumbQuick` holds the picture) and no edit has moved the photo on to a settings
     /// hash of its own. The grid stops here instead of decoding the raw behind a thumbnail the
-    /// embedded JPEG already covers — see `grid::skips_the_real_render`.
+    /// embedded JPEG already covers — see `grid::skips_the_real_render`. A preview that arrived at
+    /// a larger bucket and is still held is final for a smaller cell too, so print cells at
+    /// different sizes do not replace it every frame.
     pub fn thumb_quick_is_final(&self, photo: &Arc<lightcraft_catalog::Photo>, bucket: usize, priority: u32) -> bool {
         let Some((old, size, key)) = self.embedded_thumbs.get(&photo.id) else { return false };
-        old.as_ptr() == Arc::as_ptr(photo) && *size == bucket && !self.request_needed(Slot::ThumbQuick(photo.id), *key, priority)
+        if old.as_ptr() != Arc::as_ptr(photo) || *size < bucket {
+            return false;
+        }
+        let slot = Slot::ThumbQuick(photo.id);
+        if *size > bucket {
+            // A larger preview serves a smaller cell only when its pixels are actually here for
+            // the recorded key. The same-bucket failure memoization below says "no" after a failed
+            // job, but a missing larger preview is not a final picture: the smaller cell must ask
+            // for its own bucket rather than stay blank until the catalog revision changes.
+            return self.textures.get(&slot).is_some_and(|t| t.key == *key);
+        }
+        // The requested bucket itself: keep the failure memoization (`failed`) unchanged.
+        !self.request_needed(slot, *key, priority)
     }
 
     /// Whether this photo's embedded-preview thumbnail is pending at the requested priority, or
@@ -372,7 +402,9 @@ impl Renderer {
     ///
     /// A caller with a higher priority than the one that queued the request takes it over once;
     /// from then on the original caller coalesces behind that higher priority instead of replacing
-    /// it back. Equal priorities keep the request that is in flight (the print cells' case).
+    /// it back. Equal priorities keep the request that is in flight (the print cells' case). This
+    /// only chooses which pending bucket survives; after it completes, a larger bucket is reused by
+    /// smaller callers ([`Self::thumb_current`]) rather than being replaced every frame.
     ///
     /// A full render queued behind a stand-in is submitted at [`crate::panels::grid::BACKGROUND_THUMB_PRIORITY`],
     /// deliberately below an on-screen caller. That is not the caller's priority, so the comparison
@@ -1314,6 +1346,35 @@ mod thumbnail_tests {
         assert!(!r.thumb_current(&p, 384, 10));
     }
 
+    /// A larger texture only serves a smaller bucket when it is the recorded request's picture.
+    /// This isolates the key guard: under a `contains_key`-only check the first assertion below
+    /// would return `true`.
+    #[test]
+    fn larger_texture_for_another_key_does_not_count_as_current() {
+        let p = photo();
+        let slot = Slot::Thumb(p.id);
+        let ctx = egui::Context::default();
+        let tex = |key| Tex {
+            key,
+            photo: p.id,
+            tex: ctx.load_texture(format!("thumb-{key}"), egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]), Default::default()),
+            size: [1, 1],
+            histogram: None,
+            ms: 0.0,
+            quick: None,
+            pixels: None,
+        };
+        let mut r = Renderer::default();
+        // A completed larger bucket: the remembered request is bucket 512, key 77.
+        r.remember_thumb(&p, 512, 77, false, 10);
+        // Another key's pixels (for example the picture from before an edit) may still be
+        // displayed, but they are not the remembered request's picture.
+        r.textures.insert(slot, tex(66));
+        assert!(!r.thumb_current(&p, 256, 10), "a mismatched texture key must not serve a smaller bucket");
+        r.textures.insert(slot, tex(77));
+        assert!(r.thumb_current(&p, 256, 10), "the recorded key's larger texture serves the smaller bucket");
+    }
+
     #[test]
     fn a_fast_draft_is_drawn_in_the_frame_that_asked_for_it() {
         let mut s = Session::new();
@@ -1353,6 +1414,15 @@ mod thumbnail_tests {
     }
     fn fixture() -> (crate::LightcraftApp, std::rc::Rc<std::cell::RefCell<Work>>, egui::Context) {
         fixture_with(Session::new(), (*photo()).clone())
+    }
+    /// An unedited raw: its embedded camera preview is its final thumbnail (the grid's quick path).
+    fn raw_quick_fixture() -> (crate::LightcraftApp, std::rc::Rc<std::cell::RefCell<Work>>, egui::Context) {
+        let mut s = Session::new();
+        s.media.preview_loader = Some(Arc::new(|_, _| Some(lightcraft_raster::Rgba8 { width: 4, height: 4, data: vec![[200, 100, 50, 255]; 16] })));
+        let mut raw = (*photo()).clone();
+        raw.kind = lightcraft_catalog::MediaKind::Raw;
+        raw.develop = Arc::new(raw.camera_defaults());
+        fixture_with(s, raw)
     }
     fn fixture_with(mut s: Session, photo: Photo) -> (crate::LightcraftApp, std::rc::Rc<std::cell::RefCell<Work>>, egui::Context) {
         s.media.file_loader = Some(Arc::new(|_, _| {
@@ -1817,12 +1887,12 @@ mod thumbnail_tests {
     fn cells_at_different_thumbnail_buckets_keep_one_pending_request() {
         let (mut app, work, ctx) = fixture();
         let id = PhotoId(1);
+        let slot = Slot::Thumb(id);
         // A print page's cells show the same photo at different sizes. Before any texture arrives,
         // each frame's other bucket used to replace (and restart) the pending job.
         crate::panels::grid::request_thumb(&mut app, id, 256, 10);
         let built = app.renderer.thumb_jobs_built;
         assert_eq!(built, 1);
-        let slot = Slot::Thumb(id);
         let (submitted, pending) = take_job(&work);
         assert_eq!(submitted, slot);
         for _ in 0..12 {
@@ -1833,27 +1903,118 @@ mod thumbnail_tests {
         assert_eq!(app.renderer.thumb_jobs_built, built, "another bucket must not replace the pending thumbnail");
         assert!(work.borrow().jobs.is_empty(), "the pending render is not restarted");
         assert_eq!(app.renderer.pending[&slot].0, pending.key);
+        let pending_key = pending.key;
+        finish(&mut app, &work, &ctx, slot, pending.run());
+        assert_eq!(app.renderer.textures[&slot].key, pending_key);
+        assert_eq!(app.renderer.thumb_inputs[&id].1, 256, "the completed request's bucket is remembered");
+        assert!(!app.renderer.is_pending(slot));
 
-        // An edit is a different photo: its caller must not be held to the stale request.
+        // With a completed 256 thumbnail, the larger cell asks for its bucket once; the smaller
+        // cells then wait behind it instead of replacing it back every frame.
+        let built = app.renderer.thumb_jobs_built;
+        crate::panels::grid::request_thumb(&mut app, id, 512, 10);
+        assert_eq!(app.renderer.thumb_jobs_built, built + 1, "a larger bucket still upgrades");
+        let (submitted, larger) = take_job(&work);
+        assert_eq!(submitted, slot);
+        assert_ne!(larger.key, pending_key);
+        let larger_key = app.renderer.pending[&slot].0;
+        assert_eq!(larger_key, larger.key);
+        for _ in 0..12 {
+            crate::panels::grid::request_thumb(&mut app, id, 512, 10);
+            crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+            crate::panels::grid::request_thumb(&mut app, id, 256, 10);
+        }
+        assert_eq!(app.renderer.thumb_jobs_built, built + 1, "smaller cells keep the larger render in flight");
+        assert!(work.borrow().jobs.is_empty(), "the larger render is not restarted");
+        assert_eq!(app.renderer.pending[&slot].0, larger_key);
+        assert_eq!(app.renderer.thumb_inputs[&id].1, 512, "the in-flight bucket is still the larger one");
+        finish(&mut app, &work, &ctx, slot, larger.run());
+        assert_eq!(app.renderer.textures[&slot].key, larger_key);
+        assert_eq!(app.renderer.thumb_inputs[&id].1, 512);
+        assert!(!app.renderer.is_pending(slot));
+
+        // Once the largest visible bucket is complete, every smaller cell reuses those pixels.
+        // The 8x8 fixture texture cannot show its requested edge, so the remembered bucket, key
+        // and photo identity are what prove no render was built. Repeated frames at all sizes
+        // (the old bug alternated 256/512 forever) must settle with nothing further requested.
+        let built = app.renderer.thumb_jobs_built;
+        for _ in 0..24 {
+            crate::panels::grid::request_thumb(&mut app, id, 256, 10);
+            crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+            crate::panels::grid::request_thumb(&mut app, id, 512, 10);
+            crate::panels::grid::request_thumb(&mut app, id, 384, 8);
+        }
+        assert_eq!(app.renderer.thumb_jobs_built, built, "completed larger thumbnails serve smaller cells");
+        assert!(work.borrow().jobs.is_empty());
+        assert!(!app.renderer.is_pending(slot));
+        assert_eq!(app.renderer.textures[&slot].key, larger_key);
+        assert_eq!(app.renderer.thumb_inputs[&id].1, 512);
+        assert_eq!(app.renderer.thumb_inputs[&id].2, larger_key);
+
+        // The renderer remembers the photo through a `Weak<Photo>` only. That is enough for
+        // `Catalog`'s `Arc::make_mut` to copy the photo on edit (std: an existing weak pointer
+        // forces a new allocation even with a single strong reference), so the identity below is
+        // invalidated without this test holding an extra `Arc<Photo>`.
+        let remembered = app.renderer.thumb_inputs[&id].0.clone();
+        let remembered_ptr = remembered.as_ptr();
+        assert!(remembered.upgrade().is_some(), "the remembered Weak points at the live catalog photo");
+        assert_eq!(
+            Arc::strong_count(app.session.catalog.photo(id).unwrap()),
+            1,
+            "the catalog is the only strong owner; the renderer keeps just a Weak"
+        );
+
+        // An edit is a different photo/content key: the completed larger picture must not be
+        // reused for a smaller cell, and the replacement is requested as before.
         let mut edit = lightcraft_develop::DevelopSettings::default();
-        edit.light.exposure = 2.0;
+        edit.light.exposure = 3.0;
         app.session.catalog.apply(Op::SetDevelop { id, settings: Arc::new(edit), label: "edit".into(), edited: None }).unwrap();
-        crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+        let current = app.session.catalog.photo(id).unwrap();
+        assert_ne!(Arc::as_ptr(current), remembered_ptr, "make_mut moved the edited photo to a new allocation");
+        assert_eq!(remembered.strong_count(), 0, "the renderer's Weak now points at the old, unowned allocation");
+        assert_eq!(Arc::strong_count(current), 1, "the edit left one strong owner; no extra Arc was needed");
+        let built = app.renderer.thumb_jobs_built;
+        crate::panels::grid::request_thumb(&mut app, id, 256, 10);
         assert_eq!(app.renderer.thumb_jobs_built, built + 1, "an edited photo is requested again");
         let (submitted, edited) = take_job(&work);
         assert_eq!(submitted, slot);
-        assert_ne!(edited.key, pending.key);
+        assert_ne!(edited.key, larger_key);
+        let edited_key = edited.key;
         finish(&mut app, &work, &ctx, slot, edited.run());
-        assert!(app.renderer.thumb(id).is_some());
+        assert_eq!(app.renderer.textures[&slot].key, edited_key);
+        assert_eq!(app.renderer.thumb_inputs[&id].1, 256);
+        assert!(!app.renderer.is_pending(slot));
+    }
 
-        // With its thumbnail here, a cell at another bucket upgrades (once), then stays there.
+    /// The remembered larger bucket is not a picture by itself: once its texture is evicted, a
+    /// smaller cell must render again rather than trust the stale record.
+    #[test]
+    fn an_evicted_larger_thumbnail_is_rebuilt_for_a_smaller_cell() {
+        let (mut app, work, ctx) = fixture();
+        let id = PhotoId(1);
+        let slot = Slot::Thumb(id);
+        crate::panels::grid::request_thumb(&mut app, id, 512, 10);
+        let (submitted, larger) = take_job(&work);
+        assert_eq!(submitted, slot);
+        let larger_key = larger.key;
+        finish(&mut app, &work, &ctx, slot, larger.run());
+        assert_eq!(app.renderer.textures[&slot].key, larger_key);
+        assert_eq!(app.renderer.thumb_inputs[&id].1, 512);
+        assert!(!app.renderer.is_pending(slot));
+
+        // An LRU trim drops the pixels; the remembered bucket/key must not stand in for them.
+        app.renderer.textures.remove(&slot);
         let built = app.renderer.thumb_jobs_built;
         crate::panels::grid::request_thumb(&mut app, id, 256, 10);
-        assert_eq!(app.renderer.thumb_jobs_built, built + 1);
-        for _ in 0..12 {
-            crate::panels::grid::request_thumb(&mut app, id, 256, 10);
-        }
-        assert_eq!(app.renderer.thumb_jobs_built, built + 1, "the bucket being rendered is not requested again");
+        assert_eq!(app.renderer.thumb_jobs_built, built + 1, "an evicted larger thumbnail is rebuilt");
+        let (submitted, rebuilt) = take_job(&work);
+        assert_eq!(submitted, slot);
+        assert_ne!(rebuilt.key, larger_key);
+        assert_eq!(app.renderer.pending[&slot].0, rebuilt.key);
+        assert_eq!(app.renderer.thumb_inputs[&id].1, 256);
+        let rebuilt_key = rebuilt.key;
+        finish(&mut app, &work, &ctx, slot, rebuilt.run());
+        assert_eq!(app.renderer.textures[&slot].key, rebuilt_key);
     }
 
     #[test]
@@ -1916,12 +2077,15 @@ mod thumbnail_tests {
         assert_eq!(app.renderer.pending[&slot].0, new_key);
         assert!(work.borrow().jobs.is_empty());
 
-        // Once the recorded key has arrived, another bucket upgrades once as before.
+        // Once the recorded key has arrived, smaller cells reuse it; a larger cell upgrades.
         finish(&mut app, &work, &ctx, slot, edited.run());
         assert_eq!(app.renderer.textures[&slot].key, new_key);
         crate::panels::grid::request_thumb(&mut app, id, 256, 10);
+        assert_eq!(app.renderer.thumb_jobs_built, built + 1);
+        assert!(!app.renderer.is_pending(slot));
+        crate::panels::grid::request_thumb(&mut app, id, 512, 10);
         assert_eq!(app.renderer.thumb_jobs_built, built + 2);
-        assert_ne!(app.renderer.pending[&slot].0, new_key, "the new bucket is requested once");
+        assert_ne!(app.renderer.pending[&slot].0, new_key, "the larger bucket is requested once");
     }
 
     #[test]
@@ -1964,12 +2128,57 @@ mod thumbnail_tests {
         assert!(!app.renderer.is_pending(quick));
 
         // An unedited raw's embedded preview is final. Repeating its bucket must not queue
-        // a full sensor render behind it.
+        // a full sensor render behind it, and a smaller cell reuses a preview that arrived
+        // at a larger bucket instead of asking for another one every frame.
         let built = app.renderer.thumb_jobs_built;
         crate::panels::grid::request_thumb(&mut app, id, 512, 10);
         assert!(!app.renderer.is_pending(full));
         assert!(work.borrow().jobs.is_empty());
         assert_eq!(app.renderer.thumb_jobs_built, built);
+        for _ in 0..6 {
+            crate::panels::grid::request_thumb(&mut app, id, 384, 10);
+            crate::panels::grid::request_thumb(&mut app, id, 256, 10);
+        }
+        assert!(!app.renderer.is_pending(full));
+        assert!(!app.renderer.is_pending(quick));
+        assert!(work.borrow().jobs.is_empty(), "the embedded preview is not rebuilt for a smaller cell");
+        assert_eq!(app.renderer.thumb_jobs_built, built);
+        assert_eq!(app.renderer.textures[&quick].key, promoted.0);
+        assert_eq!(app.renderer.embedded_thumbs[&id].1, 512, "the embedded preview's bucket is remembered");
+    }
+
+    /// The embedded preview is final only at the bucket whose pixels actually arrived. A larger
+    /// preview that was evicted, or whose job failed at that key, must not make a smaller cell
+    /// believe it is covered: that cell asks for its own quick render.
+    #[test]
+    fn missing_or_failed_larger_embedded_preview_does_not_cover_a_smaller_cell() {
+        for failed_larger in [false, true] {
+            let (mut app, _work, ctx) = raw_quick_fixture();
+            app.renderer.pool = JobPool::new(0); // deterministic quick renders via run_inline
+            let id = PhotoId(1);
+            let quick = Slot::ThumbQuick(id);
+            crate::panels::grid::request_thumb(&mut app, id, 512, 10);
+            assert_eq!(app.renderer.pool.run_inline(1), 1);
+            app.renderer.poll(&ctx, &mut app.session);
+            assert!(app.renderer.textures.contains_key(&quick));
+            assert_eq!(app.renderer.embedded_thumbs[&id].1, 512);
+            let key = app.renderer.embedded_thumbs[&id].2;
+            assert_eq!(app.renderer.textures[&quick].key, key);
+
+            // The larger picture is gone: evicted, or its job failed at that key.
+            app.renderer.textures.remove(&quick);
+            if failed_larger {
+                app.renderer.failed.insert(quick, (key, "no embedded preview".into(), app.renderer.catalog_rev, id));
+            }
+            let built = app.renderer.thumb_jobs_built;
+            crate::panels::grid::request_thumb(&mut app, id, 256, 10);
+            assert_eq!(app.renderer.thumb_jobs_built, built + 1, "a smaller cell must request its own quick render");
+            let smaller_key = app.renderer.pending[&quick].0;
+            assert_ne!(smaller_key, key);
+            assert_eq!(app.renderer.pool.run_inline(1), 1);
+            app.renderer.poll(&ctx, &mut app.session);
+            assert_eq!(app.renderer.textures[&quick].key, smaller_key);
+        }
     }
 
     #[test]

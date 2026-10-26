@@ -137,25 +137,25 @@ fn saved_limits_round_trip_and_unknown_ones_are_reset() {
 // ---- Behaviour in the running UI -------------------------------------------------------------
 
 mod in_the_loupe {
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::time::Duration;
 
     use serde_json::json;
 
     use crate::headless::Headless;
-    use crate::render::Slot;
+    use crate::render::{RenderOffload, Renderer, Slot};
     use crate::tests_render_fixtures::{HEIGHT, LONG_EDGE, RenderFixture, WIDTH};
     use crate::{LightcraftApp, Services};
+    use lightcraft_engine::SourceLevel;
+    use lightcraft_engine::media::{RenderJob, RenderResult, SourceRef};
 
     const T: Duration = Duration::from_secs(20);
     const SETTLE: Duration = Duration::from_secs(120);
 
     /// The original 24 MP procedural demo library in a 1400×900 window, the first photo open
-    /// in Detail. Kept for the two tests whose meaning depends on the demo's render cost and
-    /// neighbour prefetch (`profile_slider_drag` and the superseded-drag test).
-    fn demo_detail() -> (Headless, usize) {
-        demo_detail_in([1400.0, 900.0])
-    }
-
+    /// in Detail. Kept for `profile_slider_drag`, whose meaning depends on the demo's render cost
+    /// and neighbour prefetch.
     fn demo_detail_in(size: [f32; 2]) -> (Headless, usize) {
         let services = Services { png: None, ..Default::default() };
         let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), services);
@@ -775,25 +775,188 @@ mod in_the_loupe {
         }
     }
 
-    // Given a slider drag that outpaces the renders (each tick supersedes the last), the original
-    // the window was cut from is kept once it is decoded: not decoded again for every tick
-    #[test]
-    fn a_drag_keeps_the_decoded_original_even_when_every_result_is_superseded() {
-        let (mut h, _) = demo_detail();
-        assert_eq!(h.app.session.memory_report().full_source.bytes, 0, "fit needed no original");
-        h.app.ui.zoom = crate::state::Zoom::Percent(400.0);
-        h.app.session.begin_interaction("Exposure").unwrap();
-        let mut ticks = 0;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        while !h.app.renderer.textures.contains_key(&Slot::Region) && std::time::Instant::now() < deadline {
-            let v = (ticks % 40) as f64 * 0.02;
-            h.request("engine.execute", json!({"command": "develop.set", "params": {"control": "light.exposure", "value": v}}), T);
+    /// Work held by a test offload. [`RegionGate`] keeps `Slot::Region` jobs here; [`Held`]
+    /// keeps every job. `finished` is what the renderer's next `poll` collects.
+    #[derive(Default)]
+    struct OffloadWork {
+        jobs: Vec<RenderJob>,
+        finished: Vec<(Slot, RenderResult, f64)>,
+    }
+
+    fn take_job(work: &Rc<RefCell<OffloadWork>>) -> RenderJob {
+        let mut w = work.borrow_mut();
+        assert!(!w.jobs.is_empty(), "a render job was handed to the offload");
+        w.jobs.remove(0)
+    }
+
+    /// The next window job the UI asked for, stepping a few frames if the request is still a frame
+    /// away (deterministic frames, no wall-clock wait).
+    fn next_region_job(h: &mut Headless, work: &Rc<RefCell<OffloadWork>>) -> RenderJob {
+        for _ in 0..3 {
+            if !work.borrow().jobs.is_empty() {
+                break;
+            }
             h.step();
-            ticks += 1;
-            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert!(h.app.renderer.textures.contains_key(&Slot::Region), "a window arrived");
-        assert!(h.app.session.memory_report().full_source.bytes > 0, "the original stayed in the cache while the drag went on");
+        take_job(work)
+    }
+
+    fn deliver(work: &Rc<RefCell<OffloadWork>>, slot: Slot, result: RenderResult) {
+        work.borrow_mut().finished.push((slot, result, 0.0));
+    }
+
+    /// Holds the window jobs and runs every other job synchronously, returning it through
+    /// `finished`: the UI keeps its real `request_window` / `defer_window` / draft path, but the
+    /// window's original has not arrived until the test says so.
+    struct RegionGate(Rc<RefCell<OffloadWork>>);
+
+    impl RenderOffload for RegionGate {
+        fn try_start(&mut self, slot: Slot, job: RenderJob) -> Option<RenderJob> {
+            if slot == Slot::Region {
+                self.0.borrow_mut().jobs.push(job);
+            } else {
+                let result = job.run();
+                self.0.borrow_mut().finished.push((slot, result, 0.0));
+            }
+            None
+        }
+
+        fn finished(&mut self) -> Vec<(Slot, RenderResult, f64)> {
+            std::mem::take(&mut self.0.borrow_mut().finished)
+        }
+    }
+
+    /// Holds every job for the test to run and deliver explicitly (the standalone collector test).
+    struct Held(Rc<RefCell<OffloadWork>>);
+
+    impl RenderOffload for Held {
+        fn try_start(&mut self, _slot: Slot, job: RenderJob) -> Option<RenderJob> {
+            self.0.borrow_mut().jobs.push(job);
+            None
+        }
+
+        fn finished(&mut self) -> Vec<(Slot, RenderResult, f64)> {
+            std::mem::take(&mut self.0.borrow_mut().finished)
+        }
+    }
+
+    // Given a 400 % view of a real 24 MP photo, when the first window is decoded and accepted and
+    // later drag ticks supersede each other, then the original stays in the cache and every later
+    // window is cut from it. The first accepted result is the actual Detail wiring's job: the
+    // window `request_window` asked for (respecting `defer_window`), drafted while the drag runs.
+    #[test]
+    fn a_drag_keeps_the_decoded_original_after_the_window_is_accepted() {
+        let (_fx, mut h, native) = detail();
+        let id = h.app.session.active().expect("a photo");
+        assert_eq!(native, WIDTH as usize);
+        assert_eq!(h.app.session.memory_report().full_source.bytes, 0, "fit needed no original");
+        h.app.session.media.set_on_screen(Some(id));
+        let work = Rc::new(RefCell::new(OffloadWork::default()));
+        h.app.renderer.set_offload(Box::new(RegionGate(work.clone())));
+        let discarded = h.app.renderer.discarded;
+        h.app.ui.zoom = crate::state::Zoom::Percent(400.0);
+        h.app.session.begin_interaction("Exposure").expect("a drag");
+
+        let first = next_region_job(&mut h, &work);
+        let (first_key, first_request) = (first.key, first.request_id);
+        let view = h.app.region_view.expect("Detail asked for a window");
+        assert_eq!(view.photo, id);
+        assert_eq!(view.full, (WIDTH as usize, HEIGHT as usize), "at 400 % the window's frame is the photo's own pixels");
+        assert!(view.window.w >= 1300 && view.window.h >= 700, "the window covers the canvas: {:?}", view.window);
+        assert!(view.window.x + view.window.w <= view.full.0 && view.window.y + view.window.h <= view.full.1, "inside the frame: {:?}", view.window);
+        assert_eq!(first.request.window, Some(view.window), "the job is the window on screen");
+        assert_eq!((first.request.max_w, first.request.max_h), view.full, "the job renders the frame the view uses");
+        assert_eq!(first.request.quality, lightcraft_pipeline::Quality::Draft, "a drag drafts the window");
+        assert_eq!(first.level, SourceLevel::Full);
+        assert!(matches!(&first.source, SourceRef::File { .. }), "the first window decodes the real file");
+        assert_ne!(first_request, 0, "the renderer gave the request its own identity");
+
+        // An edit changes the desired window key while the first original is still held.
+        // Detail must defer a second decode until this first result has populated the cache.
+        let reply = h.request("engine.execute", json!({"command": "develop.set", "params": {"control": "light.exposure", "value": 0.5}}), T);
+        assert_eq!(reply["ok"], true);
+        h.step();
+        assert!(work.borrow().jobs.is_empty(), "a changed window waits for the first original");
+        assert_eq!(h.app.renderer.wanted(Slot::Region), Some(first_key));
+        assert_eq!(h.app.session.memory_report().full_source.bytes, 0);
+
+        deliver(&work, Slot::Region, first.run());
+        h.step();
+        assert!(h.app.region_view.is_some());
+        assert_eq!(h.app.renderer.textures.get(&Slot::Region).map(|t| t.key), Some(first_key), "the first window arrived");
+        assert!(h.app.session.memory_report().full_source.bytes >= WIDTH as usize * HEIGHT as usize * 3 * 4);
+        assert!(h.app.session.media.has_source(id, SourceLevel::Full), "the original was accepted before any supersession");
+
+        let second = next_region_job(&mut h, &work);
+        let (second_key, second_request) = (second.key, second.request_id);
+        assert_ne!(second_key, first_key);
+        assert_ne!(second_request, first_request);
+        assert_eq!(h.app.renderer.wanted(Slot::Region), Some(second_key), "the newer window is pending");
+        assert!(matches!(&second.source, SourceRef::Loaded(_)), "the newer window reuses the accepted original");
+
+        let reply = h.request("engine.execute", json!({"command": "develop.set", "params": {"control": "light.exposure", "value": 1.0}}), T);
+        assert_eq!(reply["ok"], true);
+        let third = next_region_job(&mut h, &work);
+        assert_ne!(third.key, second_key);
+        assert_eq!(h.app.renderer.wanted(Slot::Region), Some(third.key));
+
+        deliver(&work, Slot::Region, second.run());
+        h.step();
+        assert_eq!(h.app.renderer.textures.get(&Slot::Region).map(|t| t.key), Some(second_key), "the superseded draft still reached the screen");
+        assert_eq!(h.app.renderer.wanted(Slot::Region), Some(third.key), "the newest request is still pending");
+        assert_eq!(h.app.renderer.discarded, discarded, "the superseded draft was accepted, not discarded");
+        assert!(h.app.session.memory_report().full_source.bytes >= WIDTH as usize * HEIGHT as usize * 3 * 4);
+        assert!(matches!(&third.source, SourceRef::Loaded(_)), "the pending window still reuses the original");
+    }
+
+    // The collector's accept branch on its own: a superseded window result still carries the
+    // original it decoded, and `Renderer::poll` must insert it (`session.accept(&r)` at
+    // render.rs:911) although a newer request for the same slot is pending. The Detail wiring
+    // above can only reach this once the first original is held; this standalone test proves the
+    // cache reuse without depending on UI timing.
+    #[test]
+    fn a_superseded_window_result_keeps_the_original_it_decoded() {
+        let fixture = RenderFixture::new("preview-limit-superseded", 1);
+        let mut session = fixture.session();
+        let id = session.active().expect("a photo");
+        session.media.set_on_screen(Some(id));
+        let (full_w, full_h) = (WIDTH as usize, HEIGHT as usize);
+        let window = lightcraft_pipeline::PixelWindow { x: 1000, y: 800, w: 1300, h: 700 };
+        let next_window = lightcraft_pipeline::PixelWindow { x: 1200, y: 800, w: 1300, h: 700 };
+        let mut renderer = Renderer::with_worker_threads(1);
+        let work = Rc::new(RefCell::new(OffloadWork::default()));
+        renderer.set_offload(Box::new(Held(work.clone())));
+        let ctx = egui::Context::default();
+
+        let first = session.region_job(id, full_w, full_h, window, true).expect("the first window");
+        renderer.request(Slot::Region, first, 100);
+        let first = take_job(&work);
+        let old_key = first.key;
+        let old_request = first.request_id;
+
+        let second = session.region_job(id, full_w, full_h, next_window, true).expect("the newer window");
+        renderer.request(Slot::Region, second, 100);
+        let second = take_job(&work);
+        let new_key = second.key;
+        assert_ne!(new_key, old_key, "the newer window has its own identity");
+        assert_eq!(renderer.wanted(Slot::Region), Some(new_key));
+
+        let old = first.run();
+        assert!(old.rendered.is_ok(), "{:?}", old.rendered.as_ref().err());
+        assert_eq!(old.request_id, old_request);
+        assert_eq!(old.level, SourceLevel::Full);
+        let loaded = old.loaded.as_ref().expect("the first window decoded the original");
+        assert_eq!((loaded.image.width, loaded.image.height), (WIDTH as usize, HEIGHT as usize));
+        deliver(&work, Slot::Region, old);
+        renderer.poll(&ctx, &mut session);
+
+        assert_eq!(renderer.textures.get(&Slot::Region).map(|t| t.key), Some(old_key));
+        assert_eq!(renderer.wanted(Slot::Region), Some(new_key));
+        assert_eq!(renderer.discarded, 0, "the superseded result was accepted, not discarded");
+        assert!(session.memory_report().full_source.bytes >= full_w * full_h * 3 * 4);
+        assert!(session.media.has_source(id, SourceLevel::Full));
+        let reused = session.region_job(id, full_w, full_h, window, true).expect("another window");
+        assert!(matches!(&reused.source, SourceRef::Loaded(_)), "the accepted original is reused");
     }
 
     // Given an original bigger than the cache budget (a 64 MP raw's 797 MB exceeds the default
