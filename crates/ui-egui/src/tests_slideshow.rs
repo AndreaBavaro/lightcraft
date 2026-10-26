@@ -485,7 +485,9 @@ fn a_composed_slide_shows_during_playback() {
     let mut h = grid();
     let r = run(&mut h, "slideshow.layout", json!({"margins": 0.1, "backdropColor": "#ff0000"}));
     assert_eq!(r["marginTop"], 0.1);
-    run(&mut h, "view.slideshow", json!({"interval": 60, "fadeDuration": 0}));
+    // This checks composed pixels and explicit navigation. Rendering can take enough
+    // headless frames to pass any automatic interval before the next slide is ready.
+    run(&mut h, "view.slideshow", json!({"interval": 60, "fadeDuration": 0, "manual": true}));
     let current = photo_up(&h);
     assert!(h.step_until(SETTLE, |h| has_slide(h, current)), "the slide is composed and ready");
     h.step();
@@ -502,8 +504,10 @@ fn a_composed_slide_shows_during_playback() {
     // the next slide is composed too, and stepping shows it
     let next = play(&h).upcoming(1)[0];
     assert!(h.step_until(SETTLE, |h| has_slide(h, next)));
+    assert_eq!(photo_up(&h), current, "rendering ahead keeps the inspected slide up");
     run(&mut h, "slideshow.next", json!({}));
     h.step();
+    assert_eq!(play(&h).current(), next, "navigation shows the prepared slide");
     assert_eq!(painted(&h.paint(), 5, 5), [255, 0, 0]);
     h.settle(SETTLE);
 }
