@@ -7,6 +7,7 @@ use serde_json::json;
 use crate::headless::{Headless, RenderGate};
 use crate::render::Slot;
 use crate::state::{BeforeAfter, ViewMode, Zoom};
+use crate::tests_render_fixtures::{HEIGHT, RenderFixture, WIDTH};
 use crate::{LightcraftApp, Services};
 
 const T: Duration = Duration::from_secs(20);
@@ -133,13 +134,21 @@ fn assert_rect(actual: egui::Rect, expected: egui::Rect) {
     );
 }
 
+type AnimationView = (RenderFixture, Headless, [egui::Rect; 2], std::rc::Rc<std::cell::Cell<bool>>);
+
 /// Start with both textures ready, then hold replacement renders so worker timing cannot hide
-/// a frame of the transition or replace a cached tile under the assertions.
-fn animation_view(mode: BeforeAfter, zoom: Zoom) -> (Headless, [egui::Rect; 2], std::rc::Rc<std::cell::Cell<bool>>) {
-    let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), Services { png: None, ..Default::default() });
+/// a frame of the transition or replace a cached tile under the assertions. One real 6000×4000
+/// file-backed photo keeps the render work the animation needs, without the demo's neighbours.
+fn animation_view(mode: BeforeAfter, zoom: Zoom) -> AnimationView {
+    let fixture = RenderFixture::new("before-after-animation", 1);
+    let app = LightcraftApp::new(fixture.session(), Services { png: None, ..Default::default() });
     let mut h = Headless::new(app, [1400.0, 900.0], 1.0);
+    assert_eq!(h.app.session.catalog.len(), 1, "one real 24 MP photo");
     let r = h.request("ui.set", json!({"view": "detail", "right": "none", "filmstrip": false}), T);
     assert_eq!(r["ok"], true, "{r}");
+    let id = h.app.session.active().expect("a photo is open");
+    let photo = h.app.session.catalog.photo(id).expect("it is in the catalog");
+    assert_eq!((photo.width, photo.height), (WIDTH, HEIGHT), "the render fixture is a real 24 MP photo");
     h.app.ui.before_after = mode;
     h.app.ui.zoom = zoom;
     h.app.ui.pan = (0.5, 0.5);
@@ -162,7 +171,7 @@ fn animation_view(mode: BeforeAfter, zoom: Zoom) -> (Headless, [egui::Rect; 2], 
     assert!(!before.intersects(after), "pane clips do not overlap");
     let open = std::rc::Rc::new(std::cell::Cell::new(false));
     h.app.renderer.set_offload(Box::new(RenderGate::new(open.clone())));
-    (h, [before, after], open)
+    (fixture, h, [before, after], open)
 }
 
 fn queue_click(h: &mut Headless, pos: egui::Pos2) {
@@ -178,7 +187,7 @@ fn queue_click(h: &mut Headless, pos: egui::Pos2) {
 }
 
 fn check_click_animation(mode: BeforeAfter) {
-    let (mut h, [before, after], open) = animation_view(mode, Zoom::Fit);
+    let (_fx, mut h, [before, after], open) = animation_view(mode, Zoom::Fit);
     let shift = before.center() - after.center();
     let fit = h.app.image_rect.expect("Fit image");
     let id = h.app.session.active().expect("photo");
@@ -234,7 +243,7 @@ fn both_before_after_panes_use_the_animated_rect_top_bottom() {
 }
 
 fn check_region_animation(mode: BeforeAfter) {
-    let (mut h, [before, after], open) = animation_view(mode, Zoom::Percent(200.0));
+    let (_fx, mut h, [before, after], open) = animation_view(mode, Zoom::Percent(200.0));
     let shift = before.center() - after.center();
     let start = h.app.image_rect.expect("200 percent image");
     let tiles = [(Slot::RegionBefore, before, true), (Slot::Region, after, false)].map(|(slot, pane, is_before)| {

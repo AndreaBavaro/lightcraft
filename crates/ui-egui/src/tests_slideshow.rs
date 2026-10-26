@@ -10,6 +10,7 @@ use serde_json::json;
 
 use crate::headless::Headless;
 use crate::render::Slot;
+use crate::tests_render_fixtures::{HEIGHT, RenderFixture, WIDTH};
 use crate::{LightcraftApp, Services};
 
 const T: Duration = Duration::from_secs(20);
@@ -25,6 +26,22 @@ fn grid_sized(size: [f32; 2]) -> Headless {
     let mut h = Headless::new(app, size, 1.0);
     h.step();
     h
+}
+
+/// The slideshow's 1000×700 window over `count` real 6000×4000 file-backed photos. Used only by
+/// `next_slides_are_prepared_before_they_are_due`, where the 24 MP decode/render is the point:
+/// destructure the tuple immediately with the fixture binding first, so the renderer drops first.
+fn fixture_grid(count: usize) -> (RenderFixture, Headless) {
+    let fixture = RenderFixture::new("slideshow", count);
+    let services = Services { png: None, ..Default::default() };
+    let app = LightcraftApp::new(fixture.session(), services);
+    let mut h = Headless::new(app, [1000.0, 700.0], 1.0);
+    h.step();
+    assert_eq!(h.app.session.catalog.len(), count, "the slideshow fixture photos");
+    let id = h.app.session.active().expect("a photo is open");
+    let photo = h.app.session.catalog.photo(id).expect("it is in the catalog");
+    assert_eq!((photo.width, photo.height), (WIDTH, HEIGHT), "the slideshow fixture is a real 24 MP photo");
+    (fixture, h)
 }
 
 fn run(h: &mut Headless, command: &str, params: serde_json::Value) -> serde_json::Value {
@@ -98,7 +115,7 @@ fn turning_off_the_full_screen_preview_frees_the_slides() {
 
 #[test]
 fn next_slides_are_prepared_before_they_are_due() {
-    let mut h = grid();
+    let (_fx, mut h) = fixture_grid(8);
     // a long slide: anything rendered for the next ones is rendered ahead of time
     run(&mut h, "view.slideshow", json!({"interval": 60, "fadeDuration": 1, "preparePreviews": true, "seed": 7}));
     let ahead = play(&h).upcoming(crate::panels::slideshow::AHEAD);
@@ -115,7 +132,7 @@ fn next_slides_are_prepared_before_they_are_due() {
     h.settle(SETTLE);
 
     // off: only the slide up is rendered until the next one is due
-    let mut h = grid();
+    let (_fx2, mut h) = fixture_grid(8);
     run(&mut h, "view.slideshow", json!({"interval": 60, "preparePreviews": false}));
     let next = play(&h).upcoming(1)[0];
     let current = photo_up(&h);

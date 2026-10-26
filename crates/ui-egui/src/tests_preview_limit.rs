@@ -143,17 +143,20 @@ mod in_the_loupe {
 
     use crate::headless::Headless;
     use crate::render::Slot;
+    use crate::tests_render_fixtures::{HEIGHT, LONG_EDGE, RenderFixture, WIDTH};
     use crate::{LightcraftApp, Services};
 
     const T: Duration = Duration::from_secs(20);
     const SETTLE: Duration = Duration::from_secs(120);
 
-    /// The demo library in a 1400×900 window, the first photo open in Detail.
-    fn detail() -> (Headless, usize) {
-        detail_in([1400.0, 900.0])
+    /// The original 24 MP procedural demo library in a 1400×900 window, the first photo open
+    /// in Detail. Kept for the two tests whose meaning depends on the demo's render cost and
+    /// neighbour prefetch (`profile_slider_drag` and the superseded-drag test).
+    fn demo_detail() -> (Headless, usize) {
+        demo_detail_in([1400.0, 900.0])
     }
 
-    fn detail_in(size: [f32; 2]) -> (Headless, usize) {
+    fn demo_detail_in(size: [f32; 2]) -> (Headless, usize) {
         let services = Services { png: None, ..Default::default() };
         let app = LightcraftApp::new(lightcraft_engine::Session::with_demo(), services);
         let mut h = Headless::new(app, size, 1.0);
@@ -168,6 +171,34 @@ mod in_the_loupe {
         (h, native)
     }
 
+    /// Two real 6000×4000 file-backed photos in a 1400×900 window, the first open in Detail.
+    /// Destructure the returned tuple immediately, binding the fixture before `Headless`, so the
+    /// app drops first. Keeping the tuple intact would drop its fixture field first.
+    fn detail() -> (RenderFixture, Headless, usize) {
+        detail_in([1400.0, 900.0])
+    }
+
+    fn detail_in(size: [f32; 2]) -> (RenderFixture, Headless, usize) {
+        detail_with(RenderFixture::new("preview", 2), size)
+    }
+
+    fn detail_with(fixture: RenderFixture, size: [f32; 2]) -> (RenderFixture, Headless, usize) {
+        let services = Services { png: None, ..Default::default() };
+        let app = LightcraftApp::new(fixture.session(), services);
+        let mut h = Headless::new(app, size, 1.0);
+        let r = h.request("ui.set", json!({"view": "detail", "right": "none", "filmstrip": false}), T);
+        assert_eq!(r["ok"], true, "{r}");
+        h.settle(SETTLE);
+        let (native, dims) = {
+            let id = h.app.session.active().expect("a photo is open");
+            let p = h.app.session.catalog.photo(id).expect("it is in the catalog");
+            (p.width.max(p.height) as usize, (p.width, p.height))
+        };
+        assert_eq!(dims, (WIDTH, HEIGHT), "the render fixture is a real 24 MP landscape 3:2 photo");
+        assert_eq!(native, LONG_EDGE, "the render fixture is a real 24 MP photo");
+        (fixture, h, native)
+    }
+
     fn rendered_long_edge(h: &Headless) -> usize {
         let t = h.app.renderer.textures.get(&Slot::Main).expect("the loupe rendered");
         t.size[0].max(t.size[1])
@@ -178,7 +209,7 @@ mod in_the_loupe {
     // cut from the photo's own pixels
     #[test]
     fn one_to_one_is_a_canvas_sized_frame_plus_a_native_window() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
         let main = rendered_long_edge(&h);
@@ -195,7 +226,7 @@ mod in_the_loupe {
     // overlay swaps the window for one with the other look
     #[test]
     fn a_mask_overlay_at_one_to_one_is_a_window_and_keeps_zoom_and_pan() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         for (command, params) in [("panel.masking", json!({})), ("mask.add", json!({"kind": "radial", "center": [0.4, 0.5], "rx": 0.2, "ry": 0.2}))] {
             let r = h.request("engine.execute", json!({"command": command, "params": params}), T);
             assert_eq!(r["ok"], true, "{command}: {r}");
@@ -233,7 +264,7 @@ mod in_the_loupe {
     // size (slower, and its detail stops at the frame render's resolution)
     #[test]
     fn an_all_masks_overlay_at_one_to_one_is_a_window() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         for (command, params) in [
             ("panel.masking", json!({})),
             ("mask.add", json!({"kind": "radial", "center": [0.4, 0.5], "rx": 0.2, "ry": 0.2})),
@@ -266,7 +297,7 @@ mod in_the_loupe {
     // photo's full size; switching the proof off swaps the window back to the plain look
     #[test]
     fn soft_proofing_at_one_to_one_is_a_window() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
         let plain = h.app.region_view.expect("a window render without the proof");
@@ -288,7 +319,7 @@ mod in_the_loupe {
     // window render carrying the overlay, over a canvas-sized whole frame, as without it
     #[test]
     fn visualize_spots_at_one_to_one_is_a_window() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
         let plain = h.app.region_view.expect("a window render without the overlay");
@@ -306,7 +337,7 @@ mod in_the_loupe {
     // Given the user capped the preview at 1600 px, then 1:1 is rendered no larger than that
     #[test]
     fn an_explicit_limit_still_caps_one_to_one() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         assert!(native > 1600, "the demo photo must be larger than the cap for this to mean anything (is {native})");
         h.app.ui.settings.preview_limit = 1600;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
@@ -321,7 +352,7 @@ mod in_the_loupe {
     // Given a fit view, the whole-frame render is all there is: no second render, no original decoded
     #[test]
     fn a_fit_view_makes_no_window_render() {
-        let (h, _) = detail();
+        let (_fx, h, _) = detail();
         assert_eq!(region_tile(&h), None);
         assert_eq!(h.app.region_view, None);
     }
@@ -330,7 +361,7 @@ mod in_the_loupe {
     // rendered on its own at the zoom scale and drawn over the whole-frame render
     #[test]
     fn a_capped_one_to_one_view_gets_a_sharp_window() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.app.ui.settings.preview_limit = 1600;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -345,7 +376,7 @@ mod in_the_loupe {
     // Given 800 % zoom (a frame of 48000 px), the window is rendered and bounded
     #[test]
     fn eight_to_one_renders_only_what_is_visible() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.app.ui.zoom = crate::state::Zoom::Percent(800.0);
         h.settle(SETTLE);
         let (w, hh) = region_tile(&h).expect("a window render");
@@ -361,7 +392,7 @@ mod in_the_loupe {
     // same place of the frame (a shift, a flip or a wrong scale would not)
     #[test]
     fn the_window_lines_up_with_the_whole_frame_render() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.renderer.keep_pixels = true;
         h.app.ui.settings.preview_limit = 1600;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
@@ -369,26 +400,31 @@ mod in_the_loupe {
         let view = h.app.region_view.expect("a window render");
         let tile = h.app.renderer.textures.get(&Slot::Region).and_then(|t| t.pixels.clone()).expect("tile pixels");
         let main = h.app.renderer.textures.get(&Slot::Main).and_then(|t| t.pixels.clone()).expect("main pixels");
-        let (mut sum, mut n) = (0.0f32, 0.0f32);
-        for j in (8..tile.size[1] - 8).step_by(37) {
-            for i in (8..tile.size[0] - 8).step_by(37) {
-                // the same point of the frame in the whole-frame render
-                let u = (view.window.x + i) as f32 / view.full.0 as f32;
-                let v = (view.window.y + j) as f32 / view.full.1 as f32;
-                let (mx, my) =
-                    (((u * main.size[0] as f32) as usize).min(main.size[0] - 1), ((v * main.size[1] as f32) as usize).min(main.size[1] - 1));
-                let (a, b) = (tile.pixels[j * tile.size[0] + i], main.pixels[my * main.size[0] + mx]);
-                sum += (0..3).map(|k| (a.to_array()[k] as f32 - b.to_array()[k] as f32).abs()).sum::<f32>() / 3.0;
-                n += 1.0;
+        let mean_difference = |offset: usize| {
+            let (mut sum, mut n) = (0.0f32, 0.0f32);
+            for j in (8..tile.size[1] - 8).step_by(37) {
+                for i in (8..tile.size[0] - 8).step_by(37) {
+                    // the same point of the frame in the whole-frame render
+                    let u = (view.window.x + i + offset) as f32 / view.full.0 as f32;
+                    let v = (view.window.y + j) as f32 / view.full.1 as f32;
+                    let (mx, my) =
+                        (((u * main.size[0] as f32) as usize).min(main.size[0] - 1), ((v * main.size[1] as f32) as usize).min(main.size[1] - 1));
+                    let (a, b) = (tile.pixels[j * tile.size[0] + i], main.pixels[my * main.size[0] + mx]);
+                    sum += (0..3).map(|k| (a.to_array()[k] as f32 - b.to_array()[k] as f32).abs()).sum::<f32>() / 3.0;
+                    n += 1.0;
+                }
             }
-        }
-        assert!(sum / n < 6.0, "mean difference {:.2} / 255 between the window and the frame render", sum / n);
+            sum / n
+        };
+        let difference = mean_difference(0);
+        assert!(difference < 6.0, "mean difference {:.2} / 255 between the window and the frame render", difference);
+        assert!(mean_difference(16) > 6.0, "the fixture must expose a 16-pixel horizontal misalignment");
     }
 
     // Given a Fit view, a slider drag (whose Main draft is at 0.6 scale) does not start window renders
     #[test]
     fn a_slider_drag_at_fit_makes_no_window_render() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.session.begin_interaction("Exposure").unwrap();
         for _ in 0..5 {
             h.step();
@@ -400,7 +436,7 @@ mod in_the_loupe {
     // Given a zoomed view with a window render, when I zoom back to Fit, then the window's texture is freed
     #[test]
     fn the_window_texture_is_freed_when_it_is_not_needed() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.settings.preview_limit = 1600;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -415,7 +451,7 @@ mod in_the_loupe {
     // too (while one is held the app never counts as idle and keeps the GPU copy of the original)
     #[test]
     fn leaving_a_zoomed_detail_view_frees_its_windows() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.before_after = crate::state::BeforeAfter::SideBySide;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -430,7 +466,7 @@ mod in_the_loupe {
     // is no longer current and is replaced by one for the new look
     #[test]
     fn an_edit_replaces_the_window() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.settings.preview_limit = 1600;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -446,7 +482,7 @@ mod in_the_loupe {
     // Given a photo with spot removal, a zoomed view still gets its sharp window
     #[test]
     fn a_photo_with_spots_gets_a_window_too() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         let id = h.app.session.active().unwrap();
         let mut s = (*h.app.session.develop_of(id).unwrap()).clone();
         s.spots.push(lightcraft_develop::Spot {
@@ -466,7 +502,7 @@ mod in_the_loupe {
     // I zoom to 1:1 and 8:1, then no texture the loupe holds is larger than that
     #[test]
     fn no_loupe_texture_exceeds_the_gpu_limit() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.max_texture_side = 2048;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -486,7 +522,7 @@ mod in_the_loupe {
     // the whole canvas: no strip of the magnified whole-frame render beside it
     #[test]
     fn a_window_covers_a_canvas_wider_than_2048_px() {
-        let (mut h, native) = detail_in([2600.0, 1200.0]);
+        let (_fx, mut h, native) = detail_in([2600.0, 1200.0]);
         assert!(native > 2600, "the photo is wider than the canvas at 1:1: {native}");
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -507,7 +543,7 @@ mod in_the_loupe {
     // canvas, not the zoom: a draft of the whole frame at canvas scale and a draft of the window
     #[test]
     fn a_slider_drag_when_zoomed_in_renders_canvas_sized_drafts() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.app.ui.zoom = crate::state::Zoom::Percent(400.0);
         h.settle(SETTLE);
         h.app.session.begin_interaction("Exposure").unwrap();
@@ -542,7 +578,7 @@ mod in_the_loupe {
         // the GPU device up front (the loupe never waits for it): with one, it is the earlier
         // drag's time that makes this drag small
         let _ = lightcraft_engine::gpu::available();
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         let id = h.app.session.active().expect("a photo is open");
         h.app.drag_scale.remember_slow(id, "Exposure");
         let (main, small) = drag_exposure(&mut h);
@@ -556,7 +592,7 @@ mod in_the_loupe {
         // the GPU device up front (the loupe never waits for it): with one, this is the case where
         // the GPU is there and the render still goes to the CPU
         let _ = lightcraft_engine::gpu::available();
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         let lut = lightcraft_pipeline::ProofLut::new(2, vec![[0.5, 0.5, 0.5, 0.0]; 8]).expect("a valid table");
         h.app.ui.proof.profile = lightcraft_pipeline::register_proof_profile(0x5eed_9f01, lut);
         h.app.ui.soft_proof = true;
@@ -573,7 +609,7 @@ mod in_the_loupe {
     // Before is not a 2560 px stand-in beside a full resolution After
     #[test]
     fn side_by_side_at_one_to_one_compares_like_with_like() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.app.ui.before_after = crate::state::BeforeAfter::SideBySide;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -592,7 +628,7 @@ mod in_the_loupe {
     // beside the After's); both windows still arrive
     #[test]
     fn side_by_side_at_one_to_one_decodes_the_original_once() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         let id = h.app.session.active().expect("a photo is open");
         h.app.ui.before_after = crate::state::BeforeAfter::SideBySide;
         h.app.ui.zoom = crate::state::Zoom::Percent(100.0);
@@ -612,7 +648,7 @@ mod in_the_loupe {
     // Given the Before view alone (\), only the Before gets a window
     #[test]
     fn the_original_view_windows_only_the_before() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.before_after = crate::state::BeforeAfter::Original;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -624,7 +660,7 @@ mod in_the_loupe {
     // Given a wipe (Split), both sides are windows, drawn over the same rect
     #[test]
     fn a_wipe_windows_both_sides() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.before_after = crate::state::BeforeAfter::Split;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -635,7 +671,7 @@ mod in_the_loupe {
     // Given the Before view turned off, its window is freed
     #[test]
     fn leaving_before_after_frees_the_before_window() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.before_after = crate::state::BeforeAfter::SideBySide;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -651,7 +687,7 @@ mod in_the_loupe {
     // no stream of renders of every size in between, and the sharp window arrives once it stops
     #[test]
     fn a_pinch_holds_the_render_sizes_until_it_stops() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         let main_at_fit = rendered_long_edge(&h);
         let at = h.app.canvas_rect.unwrap().center();
         h.request("ui.move", json!({"x": at.x, "y": at.y}), T);
@@ -674,7 +710,7 @@ mod in_the_loupe {
     // differently, #280), no window is rendered: its coordinates are the frame's
     #[test]
     fn no_window_over_a_picture_that_is_not_the_frame() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
         assert!(h.app.region_view.is_some());
@@ -699,7 +735,7 @@ mod in_the_loupe {
             ([2800.0, 1700.0], 400.0, false),
             ([1400.0, 900.0], 100.0, true),
         ] {
-            let (mut h, native) = detail_in(size);
+            let (mut h, native) = demo_detail_in(size);
             h.app.ui.soft_proof = proof;
             h.app.ui.zoom = if percent == 0.0 { crate::state::Zoom::Fit } else { crate::state::Zoom::Percent(percent) };
             h.settle(SETTLE);
@@ -743,7 +779,7 @@ mod in_the_loupe {
     // the window was cut from is kept once it is decoded: not decoded again for every tick
     #[test]
     fn a_drag_keeps_the_decoded_original_even_when_every_result_is_superseded() {
-        let (mut h, _) = detail();
+        let (mut h, _) = demo_detail();
         assert_eq!(h.app.session.memory_report().full_source.bytes, 0, "fit needed no original");
         h.app.ui.zoom = crate::state::Zoom::Percent(400.0);
         h.app.session.begin_interaction("Exposure").unwrap();
@@ -765,7 +801,7 @@ mod in_the_loupe {
     // grid it is let go
     #[test]
     fn a_zoomed_original_over_the_budget_stays_until_the_view_changes() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.session.media.set_budget(16 << 20);
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -794,7 +830,7 @@ mod in_the_loupe {
     #[test]
     fn a_wipe_paints_the_before_window_over_its_stand_in() {
         for mode in [crate::state::BeforeAfter::Split, crate::state::BeforeAfter::SplitTopBottom] {
-            let (mut h, _) = detail();
+            let (_fx, mut h, _) = detail();
             h.app.ui.before_after = mode;
             h.request("engine.execute", json!({"command": "view.zoom100"}), T);
             h.settle(SETTLE);
@@ -821,7 +857,7 @@ mod in_the_loupe {
     // everywhere (not only left of the line)
     #[test]
     fn holding_backslash_in_a_wipe_paints_the_before_window_across_the_canvas() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.before_after = crate::state::BeforeAfter::Split;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -848,7 +884,7 @@ mod in_the_loupe {
     // margin (a window is wider than what its pane shows) does not spill into the neighbour
     #[test]
     fn side_by_side_windows_stay_in_their_panes() {
-        let (mut h, _) = detail_in([1800.0, 900.0]);
+        let (_fx, mut h, _) = detail_in([1800.0, 900.0]);
         h.app.ui.before_after = crate::state::BeforeAfter::SideBySide;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -864,7 +900,7 @@ mod in_the_loupe {
     // apart: the job key is the same, and one tile must not replace the other
     #[test]
     fn identical_before_and_after_keep_a_tile_each() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.before_after = crate::state::BeforeAfter::SideBySide;
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -875,7 +911,7 @@ mod in_the_loupe {
     // to the whole frame at the drawn size, and tries windows again when the look changes
     #[test]
     fn a_refused_window_falls_back_to_a_full_size_render() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
         assert!(h.app.region_view.is_some());
@@ -894,7 +930,7 @@ mod in_the_loupe {
     // pinch stops: a new, ever wider window every frame is not asked for
     #[test]
     fn pinching_out_asks_for_no_new_windows() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.zoom = crate::state::Zoom::Percent(400.0);
         h.settle(SETTLE);
         let key = h.app.region_view.expect("a window").key;
@@ -910,7 +946,7 @@ mod in_the_loupe {
     // slider drag still reuses them: they are not cleared every frame
     #[test]
     fn a_drag_over_the_stage_budget_does_not_clear_the_open_views() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.ui.zoom = crate::state::Zoom::Percent(100.0);
         h.settle(SETTLE);
         let held = |h: &Headless| {
@@ -947,7 +983,7 @@ mod in_the_loupe {
     // whole-frame render, magnified and blurred, was shown)
     #[test]
     fn a_display_profile_keeps_the_sharp_window_at_one_to_one() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         use_display_profile(&mut h);
         h.request("engine.execute", json!({"command": "view.zoom100"}), T);
         h.settle(SETTLE);
@@ -963,7 +999,7 @@ mod in_the_loupe {
     // …and in Compare, each pane's window too
     #[test]
     fn a_display_profile_keeps_the_compare_windows_at_one_to_one() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         use_display_profile(&mut h);
         let r = h.request("engine.execute", json!({"command": "view.compare"}), T);
         assert_eq!(r["ok"], true, "{r}");
@@ -982,7 +1018,7 @@ mod in_the_loupe {
     // a display
     #[test]
     fn with_the_screen_profile_the_window_is_drawn() {
-        let (mut h, native) = detail();
+        let (_fx, mut h, native) = detail();
         h.app.services.screen_profile = Some(Box::new(|| Some(lightcraft_codecs::icc::write_named(lightcraft_codecs::NamedSpace::DisplayP3))));
         h.step();
         assert!(h.app.ui.settings.display_profile.is_empty(), "no profile chosen");
@@ -1000,20 +1036,20 @@ mod in_the_loupe {
     /// RAM or more: room for both panes' 24 MP originals (288 MB each as linear float).
     const COMPARE_CACHE: usize = 768 << 20;
 
-    /// Compare view of the demo library at `zoom`, settled.
+    /// Compare view of the render fixture at `zoom`, settled.
     ///
     /// The session's cache budget is set here rather than taken from the process-wide memory
     /// budget, which other tests change while they run (Settings ▸ Performance ▸ 1 GB leaves a
     /// 512 MiB share, too small for two originals, so one pane's was evicted).
-    fn compare_at(zoom: crate::state::Zoom) -> Headless {
-        let (mut h, _) = detail();
+    fn compare_at(zoom: crate::state::Zoom) -> (RenderFixture, Headless) {
+        let (fixture, mut h, _) = detail();
         h.app.session.media.set_budget(COMPARE_CACHE);
         let r = h.request("engine.execute", json!({"command": "view.compare"}), T);
         assert_eq!(r["ok"], true, "{r}");
         assert_eq!(h.app.ui.view, crate::state::ViewMode::Compare);
         h.app.ui.zoom = zoom;
         h.settle(SETTLE);
-        h
+        (fixture, h)
     }
 
     fn native_of(h: &Headless, id: lightcraft_catalog::PhotoId) -> usize {
@@ -1025,7 +1061,7 @@ mod in_the_loupe {
     // cut from its own photo's pixels, not the 2560 px whole-frame render magnified
     #[test]
     fn compare_at_one_to_one_gets_a_sharp_window_per_pane() {
-        let h = compare_at(crate::state::Zoom::Percent(100.0));
+        let (_fx, h) = compare_at(crate::state::Zoom::Percent(100.0));
         let (sel, cand) = h.app.ui.compare.map(|(a, b)| (lightcraft_catalog::PhotoId(a), lightcraft_catalog::PhotoId(b))).expect("a pair");
         for (i, id) in [(0u8, sel), (1u8, cand)] {
             let whole = h.app.renderer.textures.get(&Slot::Compare(i)).expect("the whole-frame render");
@@ -1043,7 +1079,7 @@ mod in_the_loupe {
     // Given Compare at fit, nothing more is rendered than before windows
     #[test]
     fn compare_at_fit_makes_no_window() {
-        let h = compare_at(crate::state::Zoom::Fit);
+        let (_fx, h) = compare_at(crate::state::Zoom::Fit);
         assert_eq!(h.app.compare_windows, [None, None]);
         assert!(!h.app.renderer.textures.contains_key(&Slot::CompareRegion(0)) && !h.app.renderer.textures.contains_key(&Slot::CompareRegion(1)));
     }
@@ -1052,7 +1088,7 @@ mod in_the_loupe {
     // are freed, and back in Detail only one original is kept decoded
     #[test]
     fn leaving_a_zoomed_compare_frees_its_windows() {
-        let mut h = compare_at(crate::state::Zoom::Percent(100.0));
+        let (_fx, mut h) = compare_at(crate::state::Zoom::Percent(100.0));
         assert!(h.app.renderer.textures.contains_key(&Slot::CompareRegion(1)));
         h.app.ui.zoom = crate::state::Zoom::Fit;
         h.settle(SETTLE);
@@ -1072,7 +1108,7 @@ mod in_the_loupe {
     // at the same place of the frame, and it is painted over that render, inside the pane
     #[test]
     fn a_compare_window_lines_up_with_its_pane() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         h.app.renderer.keep_pixels = true;
         h.request("engine.execute", json!({"command": "view.compare"}), T);
         h.app.ui.zoom = crate::state::Zoom::Percent(100.0);
@@ -1082,19 +1118,24 @@ mod in_the_loupe {
             let view = h.app.compare_windows[i as usize].expect("a window");
             let tile = h.app.renderer.textures.get(&Slot::CompareRegion(i)).and_then(|t| t.pixels.clone()).expect("tile pixels");
             let main = h.app.renderer.textures.get(&Slot::Compare(i)).and_then(|t| t.pixels.clone()).expect("pane pixels");
-            let (mut sum, mut n) = (0.0f32, 0.0f32);
-            for j in (8..tile.size[1] - 8).step_by(37) {
-                for x in (8..tile.size[0] - 8).step_by(37) {
-                    let u = (view.window.x + x) as f32 / view.full.0 as f32;
-                    let v = (view.window.y + j) as f32 / view.full.1 as f32;
-                    let (mx, my) =
-                        (((u * main.size[0] as f32) as usize).min(main.size[0] - 1), ((v * main.size[1] as f32) as usize).min(main.size[1] - 1));
-                    let (a, b) = (tile.pixels[j * tile.size[0] + x], main.pixels[my * main.size[0] + mx]);
-                    sum += (0..3).map(|k| (a.to_array()[k] as f32 - b.to_array()[k] as f32).abs()).sum::<f32>() / 3.0;
-                    n += 1.0;
+            let mean_difference = |offset: usize| {
+                let (mut sum, mut n) = (0.0f32, 0.0f32);
+                for j in (8..tile.size[1] - 8).step_by(37) {
+                    for x in (8..tile.size[0] - 8).step_by(37) {
+                        let u = (view.window.x + x + offset) as f32 / view.full.0 as f32;
+                        let v = (view.window.y + j) as f32 / view.full.1 as f32;
+                        let (mx, my) =
+                            (((u * main.size[0] as f32) as usize).min(main.size[0] - 1), ((v * main.size[1] as f32) as usize).min(main.size[1] - 1));
+                        let (a, b) = (tile.pixels[j * tile.size[0] + x], main.pixels[my * main.size[0] + mx]);
+                        sum += (0..3).map(|k| (a.to_array()[k] as f32 - b.to_array()[k] as f32).abs()).sum::<f32>() / 3.0;
+                        n += 1.0;
+                    }
                 }
-            }
-            assert!(sum / n < 6.0, "pane {i}: mean difference {:.2} / 255 between the window and the pane's render", sum / n);
+                sum / n
+            };
+            let difference = mean_difference(0);
+            assert!(difference < 6.0, "pane {i}: mean difference {:.2} / 255 between the window and the pane's render", difference);
+            assert!(mean_difference(16) > 6.0, "the fixture must expose a 16-pixel horizontal misalignment");
             let (whole, window) = (drawn(&h, Slot::Compare(i)), drawn(&h, Slot::CompareRegion(i)));
             assert!(!whole.is_empty() && !window.is_empty(), "pane {i}: both are painted");
             assert!(window[0].0 > whole[0].0, "pane {i}: the window is painted over the whole-frame render");
@@ -1109,7 +1150,7 @@ mod in_the_loupe {
     // drag on the active photo asks for no new window until it ends
     #[test]
     fn reference_view_at_one_to_one_gets_windows_and_a_drag_keeps_them() {
-        let (mut h, _) = detail();
+        let (_fx, mut h, _) = detail();
         let r = h.request("engine.execute", json!({"command": "photo.setReference"}), T);
         assert_eq!(r["ok"], true, "{r}");
         let r = h.request("ui.key", json!({"key": "r", "shift": true}), T);
