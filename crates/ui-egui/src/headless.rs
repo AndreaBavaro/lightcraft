@@ -1807,14 +1807,29 @@ mod tests {
         }
         // the smallest faces, so a lot of them fit on the screen
         h.request("ui.set", json!({"thumbSize": 90.0, "view": "people"}), t);
-        h.settle(SETTLE);
+        // Lay out the faces before waiting for their workers; a global settle also waits for
+        // unrelated work and hides a timed-out initial wait.
+        for _ in 0..4 {
+            h.step();
+        }
         h.step();
         let drawn = h.request("ui.widgets", json!({"filter": "unnamed-face:"}), t)["result"].as_array().map_or(0, Vec::len);
         assert!(drawn > 96, "the test needs more faces on screen than the usual budget, got {drawn}");
         // the pictures are made and kept, well beyond the old budget (a few demo photos share a scene, so two faces can share a
         // picture: the count is a little under the number of tiles)
         let started = Instant::now();
-        while h.app.renderer.variant_textures() < drawn - 20 && started.elapsed() < Duration::from_secs(60) {
+        let timeout = Duration::from_secs(300);
+        while h.app.renderer.variant_textures() < drawn - 20 {
+            let left = timeout.saturating_sub(started.elapsed());
+            assert!(
+                !left.is_zero(),
+                "variant renders did not finish: {} pictures for {drawn} faces, pending {:?}",
+                h.app.renderer.variant_textures(),
+                h.app.renderer.pending_slots()
+            );
+            // Coverage instrumentation makes the procedural scenes expensive. Wait for actual
+            // worker progress instead of continuously rebuilding a full People-view frame.
+            h.app.renderer.wait_for_worker(left.min(Duration::from_millis(250)));
             h.step();
             std::thread::sleep(Duration::from_millis(20));
         }

@@ -371,7 +371,7 @@ def main() -> int:
                 sources = json.load(handle)
             if not isinstance(sources, list) or not sources:
                 raise SystemExit("error: generated sources are not a non-empty list")
-            os.chmod(temp_output, 0o644)
+            # Keep the owner-only mkstemp mode through the atomic replacement.
             os.replace(temp_output, output)
         except subprocess.TimeoutExpired as error:
             raise SystemExit(

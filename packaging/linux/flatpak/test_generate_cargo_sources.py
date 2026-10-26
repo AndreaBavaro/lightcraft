@@ -1,6 +1,8 @@
 """Failure-path and cancellation checks for the LightCraft inventory wrapper."""
 import importlib.util
 import io
+import hashlib
+import stat
 import os
 from pathlib import Path
 import shutil
@@ -108,6 +110,43 @@ except KeyboardInterrupt:
 
 
 class InventoryFailures(unittest.TestCase):
+    def test_download_accepts_verified_bytes(self):
+        payload = b'verified fixture'
+        with patch.object(wrapper, 'urlopen', return_value=io.BytesIO(payload)), patch.object(wrapper, 'UPSTREAM_SHA256', hashlib.sha256(payload).hexdigest()):
+            self.assertEqual(wrapper.download_upstream(), payload)
+
+    def test_patch_applies_both_changes_and_checks_result_hash(self):
+        source = '\n'.join(old for _, old, _ in wrapper.PATCHES).encode()
+        expected = '\n'.join(new for _, _, new in wrapper.PATCHES).encode()
+        with patch.object(wrapper, 'PATCHED_SHA256', hashlib.sha256(expected).hexdigest()):
+            self.assertEqual(wrapper.patched_upstream(source), expected)
+        with patch.object(wrapper, 'PATCHED_SHA256', '0' * 64):
+            with self.assertRaises(SystemExit):
+                wrapper.patched_upstream(source)
+
+    def test_success_atomically_replaces_inventory_with_owner_only_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            lock = root / 'Cargo.lock'
+            lock.write_text('version = 4\n')
+            output = root / 'sources.json'
+            output.write_bytes(b'old inventory')
+            payload = b'[{"type": "archive", "url": "https://example.invalid/source"}]'
+            def generate(*args, **kwargs):
+                temporary = Path(kwargs['temp_output'])
+                self.assertEqual(output.read_bytes(), b'old inventory')
+                if os.name == 'posix':
+                    self.assertEqual(stat.S_IMODE(temporary.stat().st_mode), 0o600)
+                temporary.write_bytes(payload)
+                return 0
+            args = ['generate', str(lock), '-o', str(output), '--cache-dir', str(root / 'cache')]
+            with patch.object(sys, 'argv', args), patch.object(wrapper, 'download_upstream', return_value=b'fixture'), patch.object(wrapper, 'patched_upstream', return_value=b'fixture'), patch.object(wrapper, 'run_generator', side_effect=generate):
+                self.assertEqual(wrapper.main(), 0)
+            self.assertEqual(output.read_bytes(), payload)
+            if os.name == 'posix':
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+            self.assertEqual(list(root.glob('.sources.json.*.tmp')), [])
+
     def test_download_rejects_changed_bytes(self):
         with patch.object(wrapper, 'urlopen', return_value=io.BytesIO(b'changed upstream')):
             with self.assertRaisesRegex(SystemExit, 'checksum mismatch'):
@@ -214,15 +253,17 @@ class InventoryFailures(unittest.TestCase):
                 captured['handler'](signal.SIGINT, None)
             return real_signal(signum, handler)
 
+        environment = os.environ.copy()
+        output_path = str(temp_output)
         try:
             with patch.object(wrapper.signal, 'signal', side_effect=restore_with_signal):
                 with self.assertRaises(wrapper._Cancelled) as caught:
                     wrapper.run_generator(
                         script=script,
                         cargo_lock=lock,
-                        temp_output=str(temp_output),
+                        temp_output=output_path,
                         cwd=root,
-                        environment=os.environ.copy(),
+                        environment=environment,
                     )
         finally:
             for number in watched:

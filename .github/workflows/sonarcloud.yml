@@ -16,9 +16,11 @@ concurrency:
 
 jobs:
   sonarcloud:
-    # Tracked at @main so org-wide CI improvements propagate without PR churn.
-    uses: storytold/craft-common-actions/.github/workflows/sonarcloud.yml@main
+    # Pin the workflow that supports packaging-test coverage alongside Rust coverage.
+    uses: storytold/craft-common-actions/.github/workflows/sonarcloud.yml@e6201156974f692e0d0e426a0d6328eeda4ad3c8
     with:
+      python-coverage-source: packaging/linux/flatpak
+      python-coverage-script: packaging/linux/flatpak/test_generate_cargo_sources.py
       timeout-minutes: 120
       fonts-ref: b076417b5880bd4154bd22f00695b1d28c6bea83
     secrets: inherit

@@ -665,6 +665,22 @@ impl Renderer {
         self.pending.len()
     }
 
+    /// Requests queued or running, excluding background preparation of neighbouring photos.
+    pub fn in_flight_without_prefetch(&self) -> usize {
+        self.pending.keys().filter(|slot| !matches!(slot, Slot::Prefetch(_))).count()
+    }
+
+    /// Yield to native render workers until a result is ready or the timeout expires.
+    /// The result remains queued for the next poll. Browser and offloaded renderers do not wait.
+    /// Any native pending job, including prefetch, can satisfy the wait. A zero-worker test pool
+    /// must run its jobs inline first, or this call can only time out.
+    pub fn wait_for_worker(&mut self, timeout: std::time::Duration) -> bool {
+        if cfg!(target_arch = "wasm32") || self.offload.is_some() || self.pending.is_empty() {
+            return false;
+        }
+        self.pool.wait(timeout)
+    }
+
     /// Test seam: make the renderer look busy without starting a job (capture deadlines).
     #[cfg(test)]
     pub(crate) fn force_in_flight_for_test(&mut self, count: usize) {
@@ -1110,6 +1126,30 @@ mod thumbnail_tests {
     }
     fn photo() -> Arc<Photo> {
         Arc::new(Photo::new(PhotoId(1), Source::File { path: "audit.jpg".into() }, "audit.jpg", "JPEG", 6000, 4000, "2026-01-01"))
+    }
+
+    #[test]
+    fn capture_readiness_excludes_prefetch_but_keeps_photo_and_thumbnail_work() {
+        let p = photo();
+        let mut session = Session::new();
+        session.catalog.apply(Op::AddPhoto { photo: Box::new((*p).clone()) }).unwrap();
+        // Keep real requests queued without starting native workers.
+        let mut renderer = Renderer { pool: JobPool::new(0), ..Default::default() };
+        renderer.prefetch(Slot::Prefetch(0), session.thumb_job(p.id, 384).unwrap(), 1);
+        renderer.prefetch(Slot::Prefetch(1), session.thumb_job(p.id, 384).unwrap(), 1);
+        assert_eq!(renderer.in_flight(), 2);
+        assert_eq!(renderer.in_flight_without_prefetch(), 0);
+        for (index, slot) in [Slot::Main, Slot::Thumb(p.id), Slot::Variant(7), Slot::Preview, Slot::ThumbQuick(p.id)].into_iter().enumerate() {
+            renderer.request(slot, session.thumb_job(p.id, 384).unwrap(), 10);
+            assert_eq!(renderer.in_flight_without_prefetch(), index + 1);
+            assert_eq!(renderer.in_flight(), index + 3);
+        }
+        assert_eq!(renderer.pool.run_inline(7), 7);
+        // Waiting observes a completed job without swallowing the result needed by poll.
+        assert!(renderer.wait_for_worker(std::time::Duration::ZERO));
+        renderer.poll(&egui::Context::default(), &mut session);
+        assert_eq!(renderer.in_flight_without_prefetch(), 0);
+        assert_eq!(renderer.in_flight(), 0);
     }
     #[test]
     fn snapshot_tracks_cow_edits_undo_reload_and_replacement() {

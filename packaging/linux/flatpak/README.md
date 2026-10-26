@@ -33,6 +33,10 @@ checkout or `CARGO_TARGET_DIR`. `cargo-sources.json` is written to a temporary
 file and atomically renamed only after the generator succeeds, so a failed run
 leaves the previous inventory untouched.
 
+The regenerated inventory keeps the temporary file’s owner-only permissions (0600 on POSIX).
+Run the generator and Flatpak builder as the same user; a cross-user packaging workflow
+should explicitly install the inventory with its required ownership and permissions.
+
 Generation is capped at 30 minutes and the generator's stdin is `/dev/null`, so
 an interactive credential prompt fails instead of hanging. On POSIX systems
 (Linux is the supported Flatpak packaging platform) the generator starts in its

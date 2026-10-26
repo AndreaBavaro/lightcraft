@@ -303,6 +303,42 @@ fn a_capture_completed_after_a_catalog_edit_is_still_written() {
 }
 
 #[test]
+fn headless_capture_finishes_once_and_releases_only_its_reservation() {
+    for case in ["success", "overflow", "image-cap", "aggregate-cap"] {
+        let (mut app, seen) = app_with_screenshot_files();
+        let ctx = egui::Context::default();
+        let path = temp_png(&format!("headless-finish-{case}"));
+        let (tx, rx) = reply_channel();
+        app.last_shot_geometry = Some(geometry(100.0, 100.0));
+        let target = app.session.pin_write_target(&path.to_string_lossy()).expect("pin path");
+        app.admit_shot(&ctx, Some(target), true, tx).expect("admit");
+        let mut shot = app.pending_screenshots.pop().expect("pending shot");
+        let mut image = egui::ColorImage::filled([200, 200], egui::Color32::WHITE);
+        let other_reservations = if case == "aggregate-cap" { crate::MAX_SHOT_TOTAL_BYTES - shot.reserved } else { 0 };
+        app.shot_bytes += other_reservations;
+        if case == "overflow" {
+            image.size = [usize::MAX, 2];
+        } else if case == "image-cap" {
+            image.size = [MAX_SHOT_BYTES, 1];
+        }
+        app.finish_headless_shot(&mut shot, &image);
+        let reply = rx.try_recv().expect("one reply");
+        assert_eq!(reply["ok"], case == "success", "{case}: {reply}");
+        match case {
+            "overflow" => assert_eq!(reply["error"], "ui.screenshot: the rendered image has invalid dimensions"),
+            "image-cap" => assert!(reply["error"].as_str().expect("error message").contains("per-image limit")),
+            "aggregate-cap" => assert!(reply["error"].as_str().expect("error message").contains("bytes reserved is over")),
+            _ => {}
+        }
+        assert!(rx.try_recv().is_err(), "no duplicate reply");
+        assert_eq!(app.shot_bytes, other_reservations, "{case}");
+        assert_eq!(path.exists(), case == "success", "{case}");
+        assert_eq!(seen.lock().unwrap().is_some(), case == "success", "{case}");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
 fn an_image_larger_than_its_reservation_is_grown_and_written() {
     // Wayland has no `inner_rect`, so on a hidden tick the reservation can be based on the old
     // content rect while the compositor returns the resized surface. A legal image is not an error.
