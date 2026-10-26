@@ -18,10 +18,24 @@ pub(crate) fn temp(name: &str) -> PathBuf {
     d
 }
 
+/// Seed CPU-only settings before installing models in a fresh test folder. These tests cover catalog and
+/// model logic; GPU kernels have separate tests. Calling the settings mutation command here would also
+/// detach the process-wide detector accelerator, interfering with other tests in the same process.
+fn keep_on_cpu(s: &mut Session) {
+    let dir = s.face_models_dir.as_ref().unwrap();
+    let settings = dir.join("settings.json");
+    assert!(!settings.exists(), "only seed a fresh fixture's settings");
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(settings, br#"{"cpuOnly":true}"#).unwrap();
+    let r = s.execute("faces.gpu", &json!({})).unwrap();
+    assert_eq!(r["cpuOnly"], true, "the test session must run face models on the CPU: {r}");
+}
+
 /// A demo session with a tiny model installed and chosen.
 pub(crate) fn setup(d: &std::path::Path, dim: u64) -> (Session, String) {
     let mut s = Session::with_demo();
     s.face_models_dir = Some(d.join("models"));
+    keep_on_cpu(&mut s);
     let model = d.join(format!("tiny{dim}.onnx"));
     std::fs::write(&model, lightcraft_faces::synthetic::tiny_embedder_model(dim)).unwrap();
     let r = s.execute("faces.models.install", &json!({"path": model.to_string_lossy(), "acknowledged": true})).unwrap();
@@ -173,6 +187,7 @@ fn embeddings_are_cached_beside_the_library_and_reset_for_another_model() {
     };
     let mut s = Session::new().with_fs();
     s.face_models_dir = Some(models.clone());
+    keep_on_cpu(&mut s);
     s.open_library(&lib, true).unwrap();
     let (a, _) = two_photos(&s);
     set_regions(&mut s, a, vec![region(0.1, Some("Ann")), region(0.5, None)]);
@@ -254,6 +269,7 @@ fn the_background_pump_saves_what_it_embeds_for_the_next_launch() {
     let (lib, models) = (d.join("lib"), d.join("models"));
     let mut s = Session::new().with_fs();
     s.face_models_dir = Some(models);
+    keep_on_cpu(&mut s);
     s.open_library(&lib, true).unwrap();
     let model = d.join("tiny64.onnx");
     std::fs::write(&model, lightcraft_faces::synthetic::tiny_embedder_model(64)).unwrap();
