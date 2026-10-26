@@ -59,7 +59,7 @@ fn shift_preview_says_the_photos_capture_time_cant_be_read() {
 
     let r = h.request("ui.clickWidget", json!({"id": "button:dialogOk"}), T);
     assert_eq!(r["ok"], true, "{r}");
-    h.settle(SETTLE);
+    // Inspect the notification before settling advances the simulated clock past its lifetime.
     assert!(h.app.ui.dialog.is_none(), "OK closes the dialog");
     let toast = toast(&h);
     assert!(toast.contains("can't be read"), "OK says the photo was left as it was: {toast:?}");
@@ -92,7 +92,7 @@ fn set_mode_refuses_moving_others_by_an_unreadable_time_and_repairs_it_alone() {
     open_set(&mut h, &[bad, other]);
     let r = h.request("ui.clickWidget", json!({"id": "button:dialogOk"}), T);
     assert_eq!(r["ok"], true, "{r}");
-    h.settle(SETTLE);
+    // The click is consumed by request; unrelated rendering must not expire its notification.
     let toast = toast(&h);
     assert!(toast.contains("can't be read"), "OK says why nothing changed: {toast:?}");
     assert!(matches!(h.app.ui.dialog, Some(Dialog::CaptureTime { .. })), "the dialog stays open after the refusal");
