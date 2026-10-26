@@ -554,6 +554,12 @@ fn degenerate_crops_render_with_spots_and_masks() {
         s.execute("develop.set", &json!({"control": "effects.clarity", "value": 80})).unwrap();
         s.execute("develop.set", &json!({"control": "effects.dehaze", "value": 50})).unwrap();
         set_crop_unchecked(&mut s, rect, 30.0);
+        // Measure the degenerate render, not procedural demo generation. Load exactly the
+        // source level this crop requests; keep the original photo, effects and output size.
+        let level = s.render_job(id, 700, 450, false, true).unwrap().level;
+        let source = s.source_now(id, level).unwrap();
+        assert!(source.width > 0 && source.height > 0);
+        assert!(s.media.has_source(id, level), "the timed render must reuse the prepared source");
         let t = std::time::Instant::now();
         let r = s.render_now(id, 700, 450).unwrap();
         assert!(r.image.width >= 1 && r.image.height >= 1, "{rect:?}");
