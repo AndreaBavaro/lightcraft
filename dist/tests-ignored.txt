@@ -1,0 +1,41 @@
+tests_lock::lock_holder_child
+tests_scale::scale_100k
+bench::bench_24mp_jpeg
+cpu::tests::profile_one_real_tile
+runtime::tests::a_real_model_passes_the_self_test
+real_model::the_real_model_denoises_real_mosaics
+archive::tests::the_real_download_gives_the_model_it_should
+demo::tests::with_a_broken_global_pool
+tests_face_models::real_download_of_yunet_installs_it_and_detects
+tests_face_models::real_downloads_of_the_recognisers_start_and_can_be_cancelled
+tests_import_move::write_policy_timing
+tests_library::scale_100k_library_queries
+tests_presets_scale::presets_scale_bench
+denoise_cpu::denoise_stage_compares_cpu_and_gpu
+denoise_real::the_real_model_denoises_real_raws_through_the_engine
+preview_read::a_preview_reads_only_the_header_and_the_preview
+runtime::tests::real_models_pass_the_self_test
+suggest::tests::probing_real_models
+yunet::tests::the_network_matches_onnx_runtime
+ctx::tests::lost_poll_child
+ctx::tests::really_lost_child
+ctx::tests::retired_child
+faces::tests::timings
+nn::tests::real_model_on_the_gpu_matches_cpu
+nn::tests::time_a_shader_build
+render::tests::bench_kernels
+gpu_probe::gpu_probe
+server::progress::shutdown_tests::output_failure_child
+tests::perf_report
+tests_geometry::debug_upright_scene
+preview_save::large_preview_save_stress
+demosaic::tests::throughput
+gaintable::bench::gain_throughput
+highlight::tests::bench_reconstruct
+tests_keyword_sidebar::probe_keyword_sidebar_cost
+tests_masking::grid_frame_100k
+tests_preview_limit::in_the_loupe::profile_slider_drag
+tests_view_cost::what_one_keyword_costs_in_a_library_of_67_000_photos
+crates/ui-egui/src/button.rs - button (line 7)
+crates/ui-egui/src/progress.rs - progress (line 5)
+crates/ui-egui/src/rating.rs - rating (line 6)
