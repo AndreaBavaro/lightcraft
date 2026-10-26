@@ -66,7 +66,23 @@ pub enum Slot {
     HdrHistogram,
 }
 
+/// Settings that can change the rendered frame. Colour-only edits, including temporarily
+/// hidden grading wheels, must not discard a decoded RAW's actual aspect ratio.
+pub(crate) fn geometry_look(settings: &lightcraft_develop::DevelopSettings) -> u64 {
+    let geometry = lightcraft_develop::DevelopSettings {
+        crop: settings.crop,
+        orientation: settings.orientation,
+        geometry: settings.geometry.clone(),
+        optics: settings.optics,
+        disabled_sections: settings.disabled_sections.iter().filter(|s| matches!(s.as_str(), "geometry" | "optics")).cloned().collect(),
+        ..Default::default()
+    };
+    geometry.hash64()
+}
+
 pub struct Tex {
+    /// Frame geometry and crop mode captured when these pixels were requested.
+    pub look: Option<(u64, bool)>,
     pub key: u64,
     pub photo: PhotoId,
     pub tex: egui::TextureHandle,
@@ -93,12 +109,14 @@ pub trait RenderOffload {
 /// worker (`None` for prefetches and failures). A 10 MP zoom window's conversion took a few ms of
 /// the UI thread on every slider step.
 struct Finished {
+    look: Option<(u64, bool)>,
     result: RenderResult,
     color: Option<Arc<egui::ColorImage>>,
 }
 
 /// Immutable identity captured when a request is submitted, not when its result is collected.
 struct Requested {
+    look: Option<(u64, bool)>,
     id: u64,
     source: Option<lightcraft_catalog::Source>,
 }
@@ -190,6 +208,8 @@ pub struct Renderer {
     #[cfg(test)]
     pub(crate) thumb_jobs_built: usize,
     requests: HashMap<Slot, Requested>,
+    /// Only jobs actually accepted by an offload: queued replacements retain identity in the job.
+    offload_looks: HashMap<u64, (u64, bool)>,
     #[cfg(test)]
     failure_messages: Vec<String>,
     /// Request id of the pixels each interactive view (loupe, before, hover) shows: a draft that
@@ -284,6 +304,7 @@ impl Renderer {
             #[cfg(test)]
             thumb_jobs_built: 0,
             requests: HashMap::new(),
+            offload_looks: HashMap::new(),
             #[cfg(test)]
             failure_messages: Vec::new(),
             shown_ids: HashMap::new(),
@@ -507,7 +528,7 @@ impl Renderer {
             lightcraft_engine::display::present(&mut r, d);
         }
         let color = r.rendered.as_ref().ok().map(|x| Arc::new(color_image(&x.image)));
-        Finished { result: r, color }
+        Finished { look: None, result: r, color }
     }
 
     fn request_needed(&self, slot: Slot, key: u64, priority: u32) -> bool {
@@ -556,7 +577,10 @@ impl Renderer {
         }
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
-        self.requests.insert(slot, Requested { id: job.request_id, source: Some(job.origin.clone()) });
+        self.requests.insert(
+            slot,
+            Requested { look: Some((geometry_look(&job.settings), job.request.apply_crop)), id: job.request_id, source: Some(job.origin.clone()) },
+        );
         // (an offload keeps its own per-view stage caches; the flag tells it to)
         let job = if slot.is_view() { job.with_stages(self.stages.entry(slot).or_default().clone()) } else { job };
         if self.offload.is_some() {
@@ -574,8 +598,9 @@ impl Renderer {
             key,
             priority,
             Box::new(move || {
+                let look = Some((geometry_look(&job.settings), job.request.apply_crop));
                 let run = || if background { lightcraft_engine::memory::in_background(|| job.run()) } else { job.run() };
-                Self::run_for(run, &display)
+                Finished { look, ..Self::run_for(run, &display) }
             }),
         );
     }
@@ -609,7 +634,10 @@ impl Renderer {
             .as_ref()
             .map(|job| job.origin.clone())
             .or_else(|| job.embedded.as_ref().map(|(path, _, _)| lightcraft_catalog::Source::File { path: path.clone() }));
-        self.requests.insert(slot, Requested { id: job.request_id, source });
+        self.requests.insert(
+            slot,
+            Requested { look: job.small.as_ref().map(|j| (geometry_look(&j.settings), j.request.apply_crop)), id: job.request_id, source },
+        );
         let key = job.key;
         let display = self.display.clone();
         self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| job.run(), &display)));
@@ -628,7 +656,7 @@ impl Renderer {
         }
         self.pending.insert(slot, (key, priority));
         let request_id = lightcraft_preview::next_tick();
-        self.requests.insert(slot, Requested { id: request_id, source: None });
+        self.requests.insert(slot, Requested { look: None, id: request_id, source: None });
         let display = self.display.clone();
         self.pool.submit(slot, key, priority, Box::new(move || Self::run_for(|| compose.result(request_id), &display)));
     }
@@ -642,13 +670,16 @@ impl Renderer {
         self.prefetched.insert(slot, job.key);
         self.pending.insert(slot, (job.key, priority));
         job.request_id = lightcraft_preview::next_tick();
-        self.requests.insert(slot, Requested { id: job.request_id, source: Some(job.origin.clone()) });
+        self.requests.insert(
+            slot,
+            Requested { look: Some((geometry_look(&job.settings), job.request.apply_crop)), id: job.request_id, source: Some(job.origin.clone()) },
+        );
         let key = job.key;
         self.pool.submit(
             slot,
             key,
             priority,
-            Box::new(move || Finished { result: lightcraft_engine::memory::in_background(|| job.run()), color: None }),
+            Box::new(move || Finished { look: None, result: lightcraft_engine::memory::in_background(|| job.run()), color: None }),
         );
     }
 
@@ -673,6 +704,7 @@ impl Renderer {
     /// Drop every texture and cached stage (another library was opened: photo ids changed meaning).
     pub fn forget_all(&mut self) {
         self.requests.clear();
+        self.offload_looks.clear();
         self.shown_ids.clear();
         self.epoch = lightcraft_preview::next_tick();
         self.preview_generation = None;
@@ -718,10 +750,12 @@ impl Renderer {
         let Some(off) = self.offload.as_mut() else { return };
         while let Some(i) = self.queue.iter().enumerate().max_by_key(|(_, q)| (q.priority, q.seq)).map(|(i, _)| i) {
             let q = self.queue.swap_remove(i);
+            let identity = (q.job.request_id, (geometry_look(&q.job.settings), q.job.request.apply_crop));
             if let Some(job) = off.try_start(q.slot, q.job) {
                 self.queue.push(Queued { job, ..q });
                 break;
             }
+            self.offload_looks.insert(identity.0, identity.1);
         }
     }
 
@@ -913,14 +947,17 @@ impl Renderer {
     fn collect(&mut self, ctx: &egui::Context, session: &mut Session, inline_ms: f64) -> bool {
         let mut finished = Vec::new();
         while let Some(done) = self.pool.try_recv() {
-            finished.push((done.slot, done.result.result, done.result.color, if done.ms > 0.0 { done.ms } else { inline_ms }));
+            finished.push((done.slot, done.result.result, done.result.color, done.result.look, if done.ms > 0.0 { done.ms } else { inline_ms }));
         }
         if let Some(off) = self.offload.as_mut() {
-            finished.extend(off.finished().into_iter().map(|(slot, r, ms)| (slot, r, None, ms)));
+            finished.extend(off.finished().into_iter().map(|(slot, r, ms)| {
+                let look = self.offload_looks.remove(&r.request_id);
+                (slot, r, None, look, ms)
+            }));
         }
         self.dispatch();
         let mut changed = false;
-        for (mut slot, mut r, mut color, ms) in finished {
+        for (mut slot, mut r, mut color, completed_look, ms) in finished {
             self.completed += 1;
             // made for another display profile than the one in use: obsolete
             if r.display.is_some_and(|id| Some(id) != self.display_id()) {
@@ -930,7 +967,7 @@ impl Renderer {
             // an interactive view still takes a superseded draft that is newer than what it
             // shows, and the source it decoded: a drag supersedes every request before it
             // finishes, and a source thrown away with them is decoded again for every tick.
-            let source = if self.requests.get(&slot).map(|request| request.id) != Some(r.request_id) {
+            let (source, look) = if self.requests.get(&slot).map(|request| request.id) != Some(r.request_id) {
                 let newer_draft = slot.is_view()
                     && self.requests.contains_key(&slot)
                     && r.request_id >= self.epoch
@@ -941,11 +978,13 @@ impl Renderer {
                     continue;
                 }
                 session.accept(&r);
-                None // superseded successful drafts have no failure diagnostic
+                (None, completed_look) // retain the geometry of these pixels, never borrow the newer request’s identity
             } else {
-                let source = self.requests.remove(&slot).and_then(|request| request.source);
+                let request = self.requests.remove(&slot);
+                let look = request.as_ref().and_then(|request| request.look);
+                let source = request.and_then(|request| request.source);
                 session.accept(&r);
-                source
+                (source, look)
             };
             if slot.is_view() {
                 self.shown_ids.insert(slot, r.request_id);
@@ -1007,6 +1046,7 @@ impl Renderer {
                 Some(t) => {
                     t.tex.set(color, egui::TextureOptions::LINEAR);
                     t.pixels = pixels;
+                    t.look = look;
                     t.key = r.key;
                     t.photo = r.photo;
                     t.size = [img.width, img.height];
@@ -1019,6 +1059,7 @@ impl Renderer {
                     self.textures.insert(
                         slot,
                         Tex {
+                            look,
                             key: r.key,
                             photo: r.photo,
                             tex,
@@ -1355,6 +1396,7 @@ mod thumbnail_tests {
         let slot = Slot::Thumb(p.id);
         let ctx = egui::Context::default();
         let tex = |key| Tex {
+            look: None,
             key,
             photo: p.id,
             tex: ctx.load_texture(format!("thumb-{key}"), egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]), Default::default()),
@@ -1758,16 +1800,68 @@ mod thumbnail_tests {
         let keys: Vec<u64> = jobs.iter().map(|j| j.key).collect();
         let mut jobs = jobs.into_iter();
         let (first, second, last) = (jobs.next().unwrap(), jobs.next().unwrap(), jobs.next().unwrap());
-        // the first draft lands while the newest is still rendering: the loupe moves on
-        finish(&mut app, &work, &ctx, Slot::Main, first.run());
+        // A decoded embedded preview can differ from the catalog's square metadata. Its
+        // superseded colour-only draft must retain the identity that enables aspect correction.
+        let mut first_result = first.run();
+        first_result.rendered.as_mut().unwrap().image = lightcraft_raster::Rgba8::new(8, 4);
+        finish(&mut app, &work, &ctx, Slot::Main, first_result);
+        assert_eq!(app.renderer.textures[&Slot::Main].size, [8, 4]);
         assert_eq!(app.renderer.textures.get(&Slot::Main).map(|t| t.key), Some(keys[0]));
         assert!(app.renderer.is_pending(Slot::Main));
+        assert_eq!(
+            app.renderer.textures[&Slot::Main].look,
+            Some((geometry_look(&lightcraft_develop::DevelopSettings::default()), true)),
+            "colour-only superseded pixels retain their geometry"
+        );
+        let current_look = geometry_look(&last.settings);
         finish(&mut app, &work, &ctx, Slot::Main, last.run());
+        assert_eq!(app.renderer.textures[&Slot::Main].look, Some((current_look, true)));
         assert_eq!(app.renderer.textures.get(&Slot::Main).map(|t| t.key), Some(keys[2]));
         // a draft older than the pixels shown never replaces them
         finish(&mut app, &work, &ctx, Slot::Main, second.run());
         assert_eq!(app.renderer.textures.get(&Slot::Main).map(|t| t.key), Some(keys[2]));
         assert!(!app.renderer.is_pending(Slot::Main));
+        assert!(app.renderer.offload_looks.is_empty(), "completed offload identities are released");
+    }
+
+    #[test]
+    fn superseded_crop_keeps_its_own_geometry_instead_of_the_latest_requests() {
+        let (mut app, work, ctx) = fixture();
+        let old = app.session.loupe_job(PhotoId(1), 8, 8, true).unwrap().draft();
+        let old_look = geometry_look(&old.settings);
+        app.renderer.request(Slot::Main, old, 100);
+        let (_, old) = take_job(&work);
+        let mut settings = lightcraft_develop::DevelopSettings::default();
+        settings.crop.geometry.rect = lightcraft_geom::Rect::new(0.0, 0.0, 0.5, 1.0);
+        let new_look = geometry_look(&settings);
+        app.session.catalog.apply(Op::SetDevelop { id: PhotoId(1), settings: Arc::new(settings), label: "crop".into(), edited: None }).unwrap();
+        let current = app.session.loupe_job(PhotoId(1), 8, 8, true).unwrap().draft();
+        app.renderer.request(Slot::Main, current, 100);
+        let (_, current) = take_job(&work);
+        finish(&mut app, &work, &ctx, Slot::Main, old.run());
+        assert_eq!(app.renderer.textures[&Slot::Main].look, Some((old_look, true)));
+        assert_ne!(old_look, new_look);
+        finish(&mut app, &work, &ctx, Slot::Main, current.run());
+        assert_eq!(app.renderer.textures[&Slot::Main].look, Some((new_look, true)));
+    }
+
+    #[test]
+    fn hidden_grading_keeps_the_completed_textures_geometry_identity() {
+        let (mut app, work, ctx) = fixture();
+        let mut settings = lightcraft_develop::DevelopSettings::default();
+        settings.grading.shadows.sat = 40.0;
+        settings.crop.geometry.rect = lightcraft_geom::Rect::new(0.1, 0.2, 0.8, 0.7);
+        app.session
+            .catalog
+            .apply(Op::SetDevelop { id: PhotoId(1), settings: Arc::new(settings.clone()), label: "grade".into(), edited: None })
+            .unwrap();
+        let expected = geometry_look(&settings);
+        let job = app.session.loupe_job(PhotoId(1), 8, 8, true).unwrap().with_hidden_grading([true, false, false]);
+        assert_ne!(job.settings.hash64(), settings.hash64(), "the view really hides a nonzero wheel");
+        app.renderer.request(Slot::Main, job, 100);
+        let (slot, job) = take_job(&work);
+        finish(&mut app, &work, &ctx, slot, job.run());
+        assert_eq!(app.renderer.textures[&Slot::Main].look, Some((expected, true)));
     }
 
     #[test]
@@ -2301,7 +2395,10 @@ mod stage_budget_tests {
         let ctx = egui::Context::default();
         let mut r = Renderer::default();
         let tex = ctx.load_texture("window", egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]), Default::default());
-        r.textures.insert(Slot::Region, Tex { key: 1, photo: PhotoId(1), tex, size: [1, 1], histogram: None, ms: 0.0, quick: None, pixels: None });
+        r.textures.insert(
+            Slot::Region,
+            Tex { look: None, key: 1, photo: PhotoId(1), tex, size: [1, 1], histogram: None, ms: 0.0, quick: None, pixels: None },
+        );
         let long_ago = std::time::Instant::now().checked_sub(IDLE_TRIM * 2).unwrap();
         r.idle = Some((long_ago, false));
         r.trim_when_idle(&ctx);
