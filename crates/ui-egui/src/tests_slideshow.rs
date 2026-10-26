@@ -2,13 +2,15 @@
 //! prepared ahead off the UI thread, transitions only between ready slides, keys and controls.
 //! Simulated time: every headless frame is 1/60 s, so nothing here sleeps.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use lightcraft_catalog::PhotoId;
 use lightcraft_engine::slideshow::Item;
 use serde_json::json;
 
-use crate::headless::Headless;
+use crate::headless::{Headless, RenderGate};
 use crate::render::Slot;
 use crate::tests_render_fixtures::{HEIGHT, RenderFixture, WIDTH};
 use crate::{LightcraftApp, Services};
@@ -33,10 +35,15 @@ fn grid_sized(size: [f32; 2]) -> Headless {
 /// destructure the tuple immediately with the fixture binding first, so the renderer drops first.
 fn fixture_grid(count: usize) -> (RenderFixture, Headless) {
     let fixture = RenderFixture::new("slideshow", count);
+    assert_eq!(fixture.paths().len(), count);
+    for (index, path) in fixture.paths().iter().enumerate() {
+        assert!(std::path::Path::new(path).is_file(), "the fixture photo exists");
+        assert!(!fixture.paths()[..index].contains(path), "each fixture photo has its own path");
+    }
     let services = Services { png: None, ..Default::default() };
     let app = LightcraftApp::new(fixture.session(), services);
     let mut h = Headless::new(app, [1000.0, 700.0], 1.0);
-    h.step();
+    assert!(h.settle(SETTLE), "the grid renders settle before controlling slide renders");
     assert_eq!(h.app.session.catalog.len(), count, "the slideshow fixture photos");
     let id = h.app.session.active().expect("a photo is open");
     let photo = h.app.session.catalog.photo(id).expect("it is in the catalog");
@@ -115,33 +122,54 @@ fn turning_off_the_full_screen_preview_frees_the_slides() {
 
 #[test]
 fn next_slides_are_prepared_before_they_are_due() {
-    let (_fx, mut h) = fixture_grid(8);
-    // a long slide: anything rendered for the next ones is rendered ahead of time
-    run(&mut h, "view.slideshow", json!({"interval": 60, "fadeDuration": 1, "preparePreviews": true, "seed": 7}));
+    let (fx, mut h) = fixture_grid(8);
+    // Hold photo slide render jobs until their ahead requests are observable. Slow wall-clock
+    // decoding must not advance the simulated playback clock while we wait for workers.
+    let open = Rc::new(Cell::new(false));
+    h.app.renderer.set_offload(Box::new(RenderGate::new(open.clone())));
+    let reply = run(&mut h, "view.slideshow", json!({"interval": 60, "fadeDuration": 1, "preparePreviews": true, "seed": 7}));
+    assert_eq!(reply["settings"]["preparePreviews"], true);
+    assert_eq!(reply["settings"]["slideDuration"], 60.0);
     let ahead = play(&h).upcoming(crate::panels::slideshow::AHEAD);
-    assert_eq!(ahead.len(), 2);
+    assert_eq!(ahead.len(), crate::panels::slideshow::AHEAD);
     let start = h.time();
-    // the slide up and the next two; their renders can finish in any order
+    // The current photo and next two are queued before any slide render completes.
     let current = photo_up(&h);
+    for item in std::iter::once(Item::Photo(current)).chain(ahead.iter().copied()) {
+        assert!(h.app.renderer.is_pending(Slot::Slide(item)), "requested before it is due: {item:?}");
+        assert!(!has_slide(&h, item), "not rendered before the gate opens: {item:?}");
+    }
+    assert!(play(&h).remaining(h.time()) > 59.0, "the first slide is not due before rendering");
+    // The gate executes the actual decode/render work synchronously when polled.
+    open.set(true);
     assert!(
         h.step_until(SETTLE, |h| has_slide(h, current) && ahead.iter().all(|id| has_slide(h, *id))),
         "the slide up and the next two slides are rendered"
     );
     assert!(h.time() - start < 60.0, "before the first is due");
     assert_eq!(photo_up(&h), current, "still on the first slide");
-    h.settle(SETTLE);
+    assert!(play(&h).remaining(h.time()) > 59.0, "renders are accepted before the first slide is due");
+    assert!(h.settle(SETTLE), "enabled-prefetch renders settle");
+    drop(h);
+    drop(fx);
 
     // off: only the slide up is rendered until the next one is due
     let (_fx2, mut h) = fixture_grid(8);
-    run(&mut h, "view.slideshow", json!({"interval": 60, "preparePreviews": false}));
+    let open = Rc::new(Cell::new(false));
+    h.app.renderer.set_offload(Box::new(RenderGate::new(open.clone())));
+    let reply = run(&mut h, "view.slideshow", json!({"interval": 60, "preparePreviews": false}));
+    assert_eq!(reply["settings"]["preparePreviews"], false);
     let next = play(&h).upcoming(1)[0];
     let current = photo_up(&h);
-    assert!(h.step_until(SETTLE, |h| has_slide(h, current)));
     for _ in 0..30 {
         h.step();
     }
+    assert!(h.app.renderer.is_pending(Slot::Slide(Item::Photo(current))), "the current slide is requested");
     assert!(!has_slide(&h, next) && !h.app.renderer.is_pending(Slot::Slide(next)), "not prepared");
-    h.settle(SETTLE);
+    open.set(true);
+    assert!(h.step_until(SETTLE, |h| has_slide(h, current)), "the current slide renders once allowed");
+    assert!(!has_slide(&h, next) && !h.app.renderer.is_pending(Slot::Slide(next)), "still not prepared");
+    assert!(h.settle(SETTLE), "disabled-prefetch renders settle");
 }
 
 #[test]
